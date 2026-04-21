@@ -1,38 +1,59 @@
 import numpy as np
-def generar_preambulo(num_bits=13, semilla=42):
+
+
+def generar_preambulo_zc(longitud=13, raiz_u=1):
     """
-    Genera un preámbulo conocido modulado en BPSK.
- 
+    Genera una secuencia Zadoff-Chu compleja de módulo constante.
+
     Parámetros
     ----------
-    num_bits : longitud del preámbulo en símbolos (recomendado: primo, ej. 13)
-    semilla  : semilla fija para que el preámbulo sea siempre el mismo
- 
+    longitud : int
+        Longitud de la secuencia ZC.
+    raiz_u : int
+        Índice de raíz (debe ser coprimo con longitud para buenas propiedades).
+
     Retorna
     -------
-    preambulo : array de +1/-1 de longitud num_bits
- 
-    Nota: transmisor y receptor usan la misma semilla para conocer la secuencia.
+    preambulo_zc : np.ndarray complejo de longitud `longitud`.
     """
-    rng = np.random.default_rng(semilla)
-    bits = rng.integers(0, 2, size=num_bits)   # bits aleatorios 0/1
-    preambulo = 2 * bits - 1                    # BPSK: 0 → -1, 1 → +1
-    return preambulo
- 
- 
+    if longitud <= 1:
+        raise ValueError("longitud debe ser mayor que 1")
+    if np.gcd(raiz_u, longitud) != 1:
+        raise ValueError("raiz_u debe ser coprimo con longitud")
+
+    n = np.arange(longitud, dtype=np.float64)
+    fase = -np.pi * raiz_u * n * (n + 1) / longitud
+    preambulo_zc = np.exp(1j * fase).astype(np.complex128)
+    return preambulo_zc
+
+
+def generar_preambulo(num_bits=13, semilla=42, tipo="zc", raiz_u=1):
+    """
+    Genera un preámbulo conocido.
+
+    Modos:
+    - tipo='zc'   : secuencia Zadoff-Chu compleja (por defecto, Fase 1 I/Q).
+    - tipo='bpsk' : secuencia BPSK real legado para compatibilidad.
+    """
+    if tipo == "zc":
+        return generar_preambulo_zc(longitud=num_bits, raiz_u=raiz_u)
+
+    if tipo == "bpsk":
+        rng = np.random.default_rng(semilla)
+        bits = rng.integers(0, 2, size=num_bits)
+        return (2 * bits - 1).astype(np.float64)
+
+    raise ValueError("tipo debe ser 'zc' o 'bpsk'")
+
+
 def generar_paquete(preambulo, num_bits_datos=20):
     """
-    Construye un paquete completo: [preámbulo | datos aleatorios].
- 
-    Parámetros
-    ----------
-    preambulo      : array BPSK del preámbulo (conocido)
-    num_bits_datos : longitud de la parte de datos (desconocida para el receptor)
- 
-    Retorna
-    -------
-    paquete : array [preámbulo | datos] en BPSK
+    Construye un paquete completo: [preámbulo | datos].
+
+    Si el preámbulo es complejo (ZC), los datos BPSK se promocionan a complejo.
     """
-    datos = np.random.choice([-1, 1], size=num_bits_datos)
+    datos = np.random.choice([-1, 1], size=num_bits_datos).astype(np.float64)
+    if np.iscomplexobj(preambulo):
+        datos = datos.astype(np.complex128)
     paquete = np.concatenate([preambulo, datos])
     return paquete

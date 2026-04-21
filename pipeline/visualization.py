@@ -237,3 +237,78 @@ def _encontrar_picos(corr_norm, tau, separacion_min=5):
                 ultimo = idx_max
 
     return picos
+
+
+def plot_roc_correlador(fpr, tpr, auc=None, ruta_salida=None):
+    """
+    Dibuja la curva ROC (TPR vs FPR) para el correlador.
+    """
+    fpr = np.asarray(fpr, dtype=float).ravel()
+    tpr = np.asarray(tpr, dtype=float).ravel()
+    if fpr.size != tpr.size:
+        raise ValueError("fpr y tpr deben tener la misma longitud")
+
+    orden = np.argsort(fpr)
+    fpr_ord = fpr[orden]
+    tpr_ord = tpr[orden]
+
+    plt.figure(figsize=(7, 6))
+    label = "ROC correlador"
+    if auc is not None:
+        label = f"ROC correlador (AUC={float(auc):.3f})"
+
+    plt.plot(fpr_ord, tpr_ord, color="royalblue", linewidth=2.0, label=label)
+    plt.plot([0, 1], [0, 1], linestyle="--", color="gray", linewidth=1.0, label="Azar")
+    plt.xlim(0.0, 1.0)
+    plt.ylim(0.0, 1.0)
+    plt.xlabel("FPR")
+    plt.ylabel("TPR")
+    plt.title("Curva ROC del correlador (por índice)")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+
+    if ruta_salida is not None:
+        os.makedirs(os.path.dirname(ruta_salida), exist_ok=True)
+        plt.savefig(ruta_salida, dpi=150)
+        print(f"Gráfica ROC guardada en {ruta_salida}")
+    plt.show()
+
+
+def plot_roc_familia_por_snr(curvas_por_snr, ruta_salida=None, carga_G=None):
+    """
+    Dibuja una familia de curvas ROC para varios SNR a carga G fija.
+    """
+    plt.figure(figsize=(7, 6))
+    for snr_db, curva in sorted(curvas_por_snr.items(), key=lambda x: float(x[0])):
+        fpr = np.asarray(curva["fpr"], dtype=float).ravel()
+        tpr = np.asarray(curva["tpr"], dtype=float).ravel()
+        orden = np.argsort(fpr)
+        auc_txt = ""
+        if "auc" in curva and curva["auc"] is not None:
+            auc_txt = f", AUC={float(curva['auc']):.3f}"
+        plt.plot(
+            fpr[orden],
+            tpr[orden],
+            linewidth=1.8,
+            label=f"SNR={float(snr_db):g} dB{auc_txt}",
+        )
+
+    plt.plot([0, 1], [0, 1], linestyle="--", color="gray", linewidth=1.0, label="Azar")
+    titulo = "Familia ROC por SNR"
+    if carga_G is not None:
+        titulo += f" (G={float(carga_G):g})"
+    plt.title(titulo)
+    plt.xlabel("FPR")
+    plt.ylabel("TPR")
+    plt.xlim(0.0, 1.0)
+    plt.ylim(0.0, 1.0)
+    plt.grid(True, alpha=0.3)
+    plt.legend(fontsize=8)
+    plt.tight_layout()
+
+    if ruta_salida is not None:
+        os.makedirs(os.path.dirname(ruta_salida), exist_ok=True)
+        plt.savefig(ruta_salida, dpi=150)
+        print(f"Familia ROC guardada en {ruta_salida}")
+    plt.show()

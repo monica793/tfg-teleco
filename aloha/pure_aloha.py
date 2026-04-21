@@ -9,87 +9,108 @@ def throughput_teorico(G):
     """S = G * e^(-2G)"""
     return G * math.exp(-2 * G)
 
-def simular_pure_aloha(G, ventana_frame_times, muestras_por_paquete = None, solo_throughput=False):
+def simular_pure_aloha(
+    G,
+    ventana_frame_times,
+    muestras_por_paquete=None,
+    solo_throughput=False,
+    devolver_mascara_colision_mac=False,
+):
     """
     Simulador de tráfico Pure ALOHA optimizado para detección con correlador.
-    
+
     ¿Qué hace esta función?
     1. Calcula cuántos paquetes se intentan enviar en un tiempo determinado (Proceso de Poisson).
     2. Asigna a cada paquete un instante de inicio aleatorio.
-    3. Detecta qué paquetes chocan físicamente (si se solapan en el tiempo).
-    4. Convierte esos tiempos en índices reales de memoria para que el correlador sepa dónde buscar.
+    3. Detecta qué paquetes chocan según el modelo MAC clásico (solape en el tiempo).
+    4. Convierte esos tiempos en índices de muestra PHY para el receptor.
 
     Parámetros:
     -----------
     G : float
-        Carga del canal. Representa el número medio de intentos de envío por cada 
-        "hueco" de tiempo (frame time). 
-        Ejemplo: G=0.5 significa que el canal está al 50% de su capacidad teórica.
-        
+        Carga del canal (intentos medios por unidad de tiempo de paquete).
     ventana_frame_times : int
-        La duración total de la simulación medida en "unidades de paquete".
-        Ejemplo: Si vale 100, simulamos el tiempo que tardarían en pasar 100 paquetes seguidos.
-        
+        Duración total de la simulación en unidades de duración de paquete.
     muestras_por_paquete : int, opcional
-        Cuántos datos (muestras) mide tu señal real (tus 1, 1, -1, -1...).
-        Es el "largo" de tu vector de símbolos. Obligatorio si no es solo_throughput.
-        
+        Muestras por paquete (1 muestra/símbolo → longitud del vector BPSK del paquete).
+        Obligatorio si solo_throughput es False.
     solo_throughput : bool
-        Si es True: Devuelve solo el valor S (éxitos/tiempo) para tus gráficas.
-        Si es False: Devuelve los índices exactos para el correlador.
+        Si True: solo devuelve S simulado.
+        Si False: devuelve instantes en muestras y conteo de paquetes en colisión MAC clásica.
+    devolver_mascara_colision_mac : bool
+        Si True (y solo_throughput False): la tupla incluye una máscara por paquete
+        (True = ese intento participa en al menos una colisión según MAC clásico).
+        Referencia auxiliar para el TFG (captura vs modelo ideal); no sustituye a la
+        verdad de llegada para métricas PHY.
 
     Retorna:
     --------
-    Si solo_throughput=True:
-        S_simulado (float): El rendimiento del canal (0.0 a 0.18).
-    Si solo_throughput=False:
-        instantes_muestras (list[int]): Lista de posiciones donde empiezan tus señales en el buffer.
-        num_colisiones_mac (int): Total de paquetes que se han pisado entre sí.
+    solo_throughput=True:
+        float — S simulado.
+    solo_throughput=False, devolver_mascara_colision_mac=False:
+        (instantes_muestras, num_paquetes_con_colision_mac)
+    solo_throughput=False, devolver_mascara_colision_mac=True:
+        (instantes_muestras, num_paquetes_con_colision_mac, colision_mac_clasica)
+        colision_mac_clasica es list[bool] de longitud N (misma orden que instantes_muestras).
     """
-    # 1. El número de paquetes sigue una distribución Poisson según la carga y ventana
-    num_frames = np.random.poisson(G * ventana_frame_times)
+    if not solo_throughput and muestras_por_paquete is None:
+        raise ValueError(
+            "muestras_por_paquete es obligatorio cuando solo_throughput=False"
+        )
 
-    if num_frames == 0:
-        return 0 if solo_throughput else ([], 0)
-    
-    tiempos = sorted([random.uniform(0, ventana_frame_times) for _ in range(num_frames)])
-    colisionados = [False] * num_frames
+    num_paquetes = int(np.random.poisson(G * ventana_frame_times))
+
+    if num_paquetes == 0:
+        if solo_throughput:
+            return 0.0
+        if devolver_mascara_colision_mac:
+            return [], 0, []
+        return [], 0
+
+    tiempos = sorted([random.uniform(0, ventana_frame_times) for _ in range(num_paquetes)])
+    colisionados = [False] * num_paquetes
 
     for i, t in enumerate(tiempos):
         vulnerable_inicio = t - 1.0
-        vulnerable_fin    = t + 1.0
-        # Mirar hacia atrás.
-        j = i - 1 
+        vulnerable_fin = t + 1.0
+        j = i - 1
         while j >= 0 and tiempos[j] > vulnerable_inicio:
             colisionados[i] = True
-            colisionados[j] = True # Si i choca con j, j también choca con i
+            colisionados[j] = True
             j -= 1
 
-        # Mirar hacia adelante. 
         j = i + 1
-        while j < num_frames and tiempos[j] < vulnerable_fin:
+        while j < num_paquetes and tiempos[j] < vulnerable_fin:
             colisionados[i] = True
-            colisionados[j] = True # Si i choca con j, j también choca con i
+            colisionados[j] = True
             j += 1
-                
-    # Cálculo de resultados 
-    num_colisiones_mac = sum(colisionados)
-    exitos = num_frames - num_colisiones_mac
-    S_simulado = exitos / ventana_frame_times # S = Éxitos / Tiempo total
+
+    num_paquetes_con_colision_mac = int(sum(colisionados))
+    exitos = num_paquetes - num_paquetes_con_colision_mac
+    S_simulado = exitos / ventana_frame_times
 
     if solo_throughput:
         return S_simulado
-    
-    # Mapeo a muestras PHY para el correlador
+
     instantes_muestras = [int(t * muestras_por_paquete) for t in tiempos]
 
-    return instantes_muestras, num_colisiones_mac
+    if devolver_mascara_colision_mac:
+        return instantes_muestras, num_paquetes_con_colision_mac, colisionados
+    return instantes_muestras, num_paquetes_con_colision_mac
 
-def barrer_G(G_valores, num_frames=50_000):
-    """Devuelve listas (S_teoricos, S_simulados) para una lista de valores G."""
-    S_teoricos  = []
+
+def barrer_G(G_valores, ventana_frame_times=50_000):
+    """
+    Devuelve listas (S_teoricos, S_simulados) para una lista de valores G.
+    Usa solo_throughput=True en la simulación (no requiere muestras_por_paquete).
+    """
+    S_teoricos = []
     S_simulados = []
     for G in G_valores:
         S_teoricos.append(throughput_teorico(G))
-        S_simulados.append(simular_pure_aloha(G, num_frames))
+        S_simulados.append(
+            simular_pure_aloha(
+                G, ventana_frame_times, solo_throughput=True
+            )
+        )
     return S_teoricos, S_simulados

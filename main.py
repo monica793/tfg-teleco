@@ -14,7 +14,28 @@ from aloha.pure_aloha import simular_pure_aloha, throughput_teorico
 from pipeline.transmitter import generar_preambulo, generar_paquete
 from pipeline.channel import canal_awgn, canal_awgn_colision
 from pipeline.correlator_decoder import correlador
-from pipeline.visualization import plot_pure_aloha,  plot_deteccion_correlador_awgn, plot_colision_correlador
+from pipeline.escenario_phy import (
+    barrer_grid_protocolo_correlador,
+    ejecutar_monte_carlo_receptor_correlador,
+    ejecutar_monte_carlo_roc_correlador,
+)
+from pipeline.protocolo_evaluacion import (
+    GRID_CARGA_G,
+    GRID_SNR_DB,
+    NUM_BITS_DATOS,
+    NUM_BITS_PRE,
+    NUM_ITERACIONES_MC,
+    NUM_ITERACIONES_MC_RAPIDO,
+    SEMILLA_BASE,
+    TOLERANCIA_MUESTRAS,
+)
+from pipeline.visualization import (
+    plot_colision_correlador,
+    plot_deteccion_correlador_awgn,
+    plot_pure_aloha,
+    plot_roc_familia_por_snr,
+    plot_roc_correlador,
+)
 
 
 # ===========================================================================
@@ -149,6 +170,168 @@ def test_nn_decoder():
     # Aquí irá el código de IA en el futuro
     pass
 
+
+def prueba_integracion_total(carga_G, ventana_frame_times=400, snr_db=6.0, tau=0.65):
+    """
+    Integración motor ALOHA → canal → correlador; métricas frente a instantes verdaderos.
+
+    La misma API de escenario (`generar_escenario_phy` en pipeline.escenario_phy) servirá
+    para el receptor por red neuronal; aquí solo se ejecuta el correlador.
+    """
+    num_bits_pre = NUM_BITS_PRE
+    num_bits_datos = NUM_BITS_DATOS
+    tolerancia_muestras = TOLERANCIA_MUESTRAS
+    num_iteraciones_mc = NUM_ITERACIONES_MC_RAPIDO
+    semilla_base = SEMILLA_BASE
+
+    resumen = ejecutar_monte_carlo_receptor_correlador(
+        carga_G=carga_G,
+        ventana_frame_times=ventana_frame_times,
+        snr_db=snr_db,
+        tau=tau,
+        tolerancia_muestras=tolerancia_muestras,
+        separacion_minima=num_bits_pre,
+        num_iteraciones=num_iteraciones_mc,
+        semilla_base=semilla_base,
+        num_bits_pre=num_bits_pre,
+        num_bits_datos=num_bits_datos,
+    )
+
+    print("=" * 60)
+    print("PRUEBA INTEGRACION: escenario PHY compartido (ALOHA + AWGN)")
+    print("=" * 60)
+    print(f"  Carga G = {carga_G}")
+    print(f"  Ventana (frame times) = {ventana_frame_times}")
+    print(f"  SNR = {snr_db} dB  |  tau = {tau}  |  MC iteraciones = {num_iteraciones_mc}")
+    print("-" * 60)
+    print(f"  TP medio por iteracion:       {resumen['tp_media']:.3f}")
+    print(f"  FP medio por iteracion:       {resumen['fp_media']:.3f}")
+    print(f"  FN medio por iteracion:       {resumen['fn_media']:.3f}")
+    print(f"  Paquetes (verdad) medio:      {resumen['paquetes_medio']:.3f}")
+    print(f"  Detecciones totales medio:    {resumen['detecciones_medio']:.3f}")
+    print("-" * 60)
+    print("  Receptor RN: pendiente; usar el mismo dict de generar_escenario_phy.")
+    print("=" * 60)
+
+    # Futuro (misma señal, mismas métricas con evaluar_detecciones):
+    # from pipeline.escenario_phy import generar_escenario_phy
+    # esc = generar_escenario_phy(carga_G, ventana_frame_times, snr_db, semilla=...)
+    # instantes_rn = receptor_red_neuronal(esc["senal_rx"])
+    # metricas_rn = evaluar_detecciones(esc["instantes_llegada_muestras"], instantes_rn, ...)
+
+    return resumen
+
+
+def test_roc_correlador(carga_G=0.4, ventana_frame_times=400, snr_db=6.0):
+    """
+    ROC canónica del correlador por indice de correlación, barriendo tau en [0,1].
+    """
+    tolerancia_muestras = TOLERANCIA_MUESTRAS
+    num_iteraciones_mc = NUM_ITERACIONES_MC_RAPIDO
+    semilla_base = SEMILLA_BASE
+    num_bits_pre = NUM_BITS_PRE
+    num_bits_datos = NUM_BITS_DATOS
+
+    roc = ejecutar_monte_carlo_roc_correlador(
+        carga_G=carga_G,
+        ventana_frame_times=ventana_frame_times,
+        snr_db=snr_db,
+        tolerancia_muestras=tolerancia_muestras,
+        num_iteraciones=num_iteraciones_mc,
+        semilla_base=semilla_base,
+        num_bits_pre=num_bits_pre,
+        num_bits_datos=num_bits_datos,
+    )
+
+    print("=" * 60)
+    print("PRUEBA ROC: correlador por índice (tau en [0,1])")
+    print("=" * 60)
+    print(f"  Carga G = {carga_G}")
+    print(f"  Ventana (frame times) = {ventana_frame_times}")
+    print(f"  SNR = {snr_db} dB")
+    print(f"  MC iteraciones = {num_iteraciones_mc}")
+    print(f"  AUC media = {roc['auc_media']:.4f}")
+    print("=" * 60)
+
+    ruta_roc = os.path.join(FIGURES, "roc_correlador.png")
+    plot_roc_correlador(
+        fpr=roc["fpr_media"],
+        tpr=roc["tpr_media"],
+        auc=roc["auc_media"],
+        ruta_salida=ruta_roc,
+    )
+
+    return roc
+
+
+def test_protocolo_comun_correlador(
+    ventana_frame_times=400,
+    tau_evento=0.65,
+    usar_modo_rapido=False,
+):
+    """
+    Ejecuta el protocolo común congelado en grid (G,SNR) y reporta tabla + ROC.
+    """
+    num_iter = NUM_ITERACIONES_MC_RAPIDO if usar_modo_rapido else NUM_ITERACIONES_MC
+    filas = barrer_grid_protocolo_correlador(
+        cargas_G=GRID_CARGA_G,
+        snrs_db=GRID_SNR_DB,
+        ventana_frame_times=ventana_frame_times,
+        tau_evento=tau_evento,
+        tolerancia_muestras=TOLERANCIA_MUESTRAS,
+        separacion_minima=NUM_BITS_PRE,
+        num_iteraciones=num_iter,
+        semilla_base=SEMILLA_BASE,
+        num_bits_pre=NUM_BITS_PRE,
+        num_bits_datos=NUM_BITS_DATOS,
+    )
+
+    print("=" * 108)
+    print("PROTOCOLO COMÚN (CONGELADO) — Tabla por (G,SNR)")
+    print("=" * 108)
+    print(
+        "  G   SNR  TP_media±std   FP_media±std   FN_media±std   Recall   Precision   F1     AUC"
+    )
+    print("-" * 108)
+    for f in filas:
+        print(
+            f"{f['G']:>3.1f} {f['SNR_dB']:>5.1f} "
+            f"{f['tp_media']:>6.2f}±{f['tp_std']:<5.2f} "
+            f"{f['fp_media']:>6.2f}±{f['fp_std']:<5.2f} "
+            f"{f['fn_media']:>6.2f}±{f['fn_std']:<5.2f} "
+            f"{f['recall']:>7.3f}   {f['precision']:>8.3f}  {f['f1']:>6.3f}  {f['auc']:>6.3f}"
+        )
+    print("=" * 108)
+
+    # Figura obligatoria: familia ROC por SNR a G fijo (primer G del grid).
+    g_ref = float(GRID_CARGA_G[0])
+    curvas_por_snr = {}
+    for snr in GRID_SNR_DB:
+        roc = ejecutar_monte_carlo_roc_correlador(
+            carga_G=g_ref,
+            ventana_frame_times=ventana_frame_times,
+            snr_db=float(snr),
+            tolerancia_muestras=TOLERANCIA_MUESTRAS,
+            num_iteraciones=num_iter,
+            semilla_base=SEMILLA_BASE,
+            num_bits_pre=NUM_BITS_PRE,
+            num_bits_datos=NUM_BITS_DATOS,
+        )
+        curvas_por_snr[float(snr)] = {
+            "fpr": roc["fpr_media"],
+            "tpr": roc["tpr_media"],
+            "auc": roc["auc_media"],
+        }
+    ruta_familia = os.path.join(FIGURES, "roc_familia_por_snr.png")
+    plot_roc_familia_por_snr(
+        curvas_por_snr=curvas_por_snr,
+        ruta_salida=ruta_familia,
+        carga_G=g_ref,
+    )
+
+    return filas
+
+
 # ── ejecución ──────────────────────────────────────────────────────────────
 if __name__ == '__main__':
 
@@ -160,7 +343,14 @@ if __name__ == '__main__':
     #print("=== Test colisión PHY ===")
     #test_colision_phy()
     # 3. Simulación física: Fase 2 (Con ruido)
-    test_phy_correlador(snr_db=2, num_bits_pre = 13, num_bits_data = 20)
+    # test_phy_correlador(snr_db=2, num_bits_pre = 13, num_bits_data = 20)
+
+    # 3b. Integración ALOHA → PHY → correlador (Monte Carlo)
+    #prueba_integracion_total(carga_G=0.4)
+    # ROC canónica (por índice) para todos los umbrales tau en [0,1]
+    test_roc_correlador(carga_G=0.4, ventana_frame_times=400, snr_db=6.0)
+    # Protocolo común congelado (tabla + familia ROC); usar_modo_rapido=True para iterar rápido
+    # test_protocolo_comun_correlador(ventana_frame_times=400, tau_evento=0.65, usar_modo_rapido=True)
     # test_phy_correlador(snr_db=-5) # Prueba a poner SNR negativo para ver cómo falla
 
     # 4. Fase de IA (Pendiente)
