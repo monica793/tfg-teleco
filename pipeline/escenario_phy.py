@@ -259,6 +259,98 @@ def ejecutar_monte_carlo_roc_correlador(
     }
 
 
+def ejecutar_receptor_neuronal(
+    escenario: dict,
+    modelo,
+    umbral: float,
+    separacion_minima: int,
+    dispositivo: str = "cpu",
+    stride: int = 1,
+    batch_size: int = 1024,
+    long_ventana: int = 128,
+):
+    """
+    Receptor PHY basado en red neuronal CNN 1D.
+
+    Desliza una ventana de `long_ventana` muestras sobre `senal_rx` con paso
+    `stride` e infiere la probabilidad de que un paquete nuevo nazca en la
+    muestra central de cada ventana. El score resultante es equivalente a
+    `corr_norm` del correlador y permite usar el mismo árbitro de métricas.
+
+    Parámetros
+    ----------
+    escenario        : dict generado por generar_escenario_phy()
+    modelo           : ModeloCNN ya entrenado (nn.Module en modo eval)
+    umbral           : umbral de probabilidad en [0, 1] para declarar detección
+    separacion_minima: distancia mínima entre picos en muestras (NMS)
+    dispositivo      : 'cpu' o 'cuda'
+    stride           : paso de la ventana deslizante (1 = resolución máxima)
+    batch_size       : número de ventanas por batch de inferencia
+    long_ventana     : longitud de cada ventana (debe coincidir con la del modelo)
+
+    Retorna
+    -------
+    dict con:
+        score_por_muestra  : np.ndarray float32 (len senal_rx,) — score en [0,1]
+                             (0 fuera del alcance de la ventana)
+        instantes_detectados: np.ndarray int64 — instantes con score >= umbral tras NMS
+    """
+    import torch
+
+    senal_rx = np.asarray(escenario["senal_rx"])
+    N = len(senal_rx)
+    mitad = long_ventana // 2   # posición de la diana dentro de cada ventana
+
+    # Generación de ventanas deslizantes
+    indices_inicio = np.arange(0, N - long_ventana + 1, stride, dtype=np.int64)
+    if indices_inicio.size == 0:
+        score_por_muestra = np.zeros(N, dtype=np.float32)
+        return {
+            "score_por_muestra": score_por_muestra,
+            "instantes_detectados": np.array([], dtype=np.int64),
+        }
+
+    n_ventanas = len(indices_inicio)
+    ventanas_iq = np.empty((n_ventanas, long_ventana, 2), dtype=np.float32)
+    for i, inicio in enumerate(indices_inicio):
+        seg = senal_rx[inicio: inicio + long_ventana]
+        ventanas_iq[i, :, 0] = seg.real.astype(np.float32)
+        ventanas_iq[i, :, 1] = seg.imag.astype(np.float32)
+
+    # (N_ventanas, 128, 2) → (N_ventanas, 2, 128) para Conv1d
+    ventanas_tensor = torch.from_numpy(
+        np.transpose(ventanas_iq, (0, 2, 1))
+    ).to(dispositivo)
+
+    modelo = modelo.to(dispositivo)
+    modelo.eval()
+
+    scores_ventanas = np.empty(n_ventanas, dtype=np.float32)
+    with torch.no_grad():
+        for inicio_batch in range(0, n_ventanas, batch_size):
+            fin_batch = min(inicio_batch + batch_size, n_ventanas)
+            logits = modelo(ventanas_tensor[inicio_batch:fin_batch])  # (B, 1)
+            probs = torch.sigmoid(logits).squeeze(1).cpu().numpy()
+            scores_ventanas[inicio_batch:fin_batch] = probs
+
+    # Asignar cada score a la muestra "diana" de su ventana
+    score_por_muestra = np.zeros(N, dtype=np.float32)
+    diana_indices = indices_inicio + mitad
+    np.maximum.at(score_por_muestra, diana_indices, scores_ventanas)
+
+    # NMS sobre el score usando la misma función que el correlador
+    instantes_detectados = buscar_picos_preambulo(
+        corr_norm=score_por_muestra,
+        tau=umbral,
+        separacion_minima=separacion_minima,
+    )
+
+    return {
+        "score_por_muestra": score_por_muestra,
+        "instantes_detectados": instantes_detectados,
+    }
+
+
 def barrer_grid_protocolo_correlador(
     cargas_G,
     snrs_db,

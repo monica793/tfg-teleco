@@ -1,6 +1,7 @@
 
 import os
 import numpy as np
+import torch
 
 # ── rutas ──────────────────────────────────────────────────────────────────
 ROOT    = os.path.dirname(__file__)
@@ -18,7 +19,11 @@ from pipeline.escenario_phy import (
     barrer_grid_protocolo_correlador,
     ejecutar_monte_carlo_receptor_correlador,
     ejecutar_monte_carlo_roc_correlador,
+    generar_escenario_phy,
+    ejecutar_receptor_neuronal,
 )
+from pipeline.metricas_receptor import evaluar_detecciones, metricas_evento_derivadas
+from ml.modelo import ModeloCNN, cargar_modelo_desde_checkpoint
 from pipeline.protocolo_evaluacion import (
     GRID_CARGA_G,
     GRID_SNR_DB,
@@ -332,6 +337,111 @@ def test_protocolo_comun_correlador(
     return filas
 
 
+def test_protocolo_comun_neuronal(
+    ruta_checkpoint: str | None = None,
+    ventana_frame_times: int = 400,
+    umbral: float = 0.5,
+    usar_modo_rapido: bool = True,
+):
+    """
+    Ejecuta el protocolo común congelado sobre el detector ML (CNN 1D) en el
+    mismo grid (G, SNR) que el correlador, permitiendo comparativa directa.
+
+    Si se proporciona `ruta_checkpoint`, carga los pesos entrenados.
+    Si no, usa el modelo sin entrenar (aleatorio) como prueba del pipeline.
+
+    Parámetros
+    ----------
+    ruta_checkpoint   : ruta al archivo .ckpt generado por entrenar_modelo.py,
+                        o None para ejecutar con pesos aleatorios (demo).
+    ventana_frame_times: horizonte temporal de cada escenario.
+    umbral            : umbral de probabilidad [0,1] para NMS del detector ML.
+    usar_modo_rapido  : si True, usa NUM_ITERACIONES_MC_RAPIDO.
+    """
+    dispositivo = "cuda" if torch.cuda.is_available() else "cpu"
+    separacion_minima = NUM_BITS_PRE   # misma que el correlador
+
+    if ruta_checkpoint is not None and os.path.exists(ruta_checkpoint):
+        modelo = cargar_modelo_desde_checkpoint(ruta_checkpoint, map_location=dispositivo)
+        print(f"[ML] Modelo cargado desde: {ruta_checkpoint}")
+    else:
+        modelo = ModeloCNN()
+        modelo.eval()
+        if ruta_checkpoint is not None:
+            print(f"[ML] ADVERTENCIA: checkpoint no encontrado en '{ruta_checkpoint}'.")
+        print("[ML] Usando modelo con pesos aleatorios (sin entrenar). "
+              "Ejecuta ml/entrenar_modelo.py para obtener un modelo entrenado.")
+
+    num_iter = NUM_ITERACIONES_MC_RAPIDO if usar_modo_rapido else NUM_ITERACIONES_MC
+
+    filas = []
+    for g in GRID_CARGA_G:
+        for snr in GRID_SNR_DB:
+            tp_hist, fp_hist, fn_hist = [], [], []
+            for k in range(num_iter):
+                esc = generar_escenario_phy(
+                    carga_G=float(g),
+                    ventana_frame_times=ventana_frame_times,
+                    snr_db=float(snr),
+                    num_bits_pre=NUM_BITS_PRE,
+                    num_bits_datos=NUM_BITS_DATOS,
+                    semilla=SEMILLA_BASE + k,
+                )
+                sal_ml = ejecutar_receptor_neuronal(
+                    escenario=esc,
+                    modelo=modelo,
+                    umbral=umbral,
+                    separacion_minima=separacion_minima,
+                    dispositivo=dispositivo,
+                )
+                metricas = evaluar_detecciones(
+                    esc["instantes_llegada_muestras"],
+                    sal_ml["instantes_detectados"],
+                    TOLERANCIA_MUESTRAS,
+                )
+                tp_hist.append(metricas["tp"])
+                fp_hist.append(metricas["fp"])
+                fn_hist.append(metricas["fn"])
+
+            tp_m = float(np.mean(tp_hist))
+            fp_m = float(np.mean(fp_hist))
+            fn_m = float(np.mean(fn_hist))
+            tp_std = float(np.std(tp_hist, ddof=0))
+            fp_std = float(np.std(fp_hist, ddof=0))
+            fn_std = float(np.std(fn_hist, ddof=0))
+            derivadas = metricas_evento_derivadas(tp_m, fp_m, fn_m)
+
+            filas.append({
+                "G": float(g),
+                "SNR_dB": float(snr),
+                "tp_media": tp_m, "tp_std": tp_std,
+                "fp_media": fp_m, "fp_std": fp_std,
+                "fn_media": fn_m, "fn_std": fn_std,
+                "recall": derivadas["recall"],
+                "precision": derivadas["precision"],
+                "f1": derivadas["f1"],
+            })
+
+    print("=" * 108)
+    print("PROTOCOLO COMÚN (CONGELADO) — Detector ML (CNN 1D)")
+    print("=" * 108)
+    print(
+        "  G   SNR  TP_media±std   FP_media±std   FN_media±std   Recall   Precision   F1"
+    )
+    print("-" * 108)
+    for f in filas:
+        print(
+            f"{f['G']:>3.1f} {f['SNR_dB']:>5.1f} "
+            f"{f['tp_media']:>6.2f}±{f['tp_std']:<5.2f} "
+            f"{f['fp_media']:>6.2f}±{f['fp_std']:<5.2f} "
+            f"{f['fn_media']:>6.2f}±{f['fn_std']:<5.2f} "
+            f"{f['recall']:>7.3f}   {f['precision']:>8.3f}  {f['f1']:>6.3f}"
+        )
+    print("=" * 108)
+
+    return filas
+
+
 # ── ejecución ──────────────────────────────────────────────────────────────
 if __name__ == '__main__':
 
@@ -353,5 +463,10 @@ if __name__ == '__main__':
     # test_protocolo_comun_correlador(ventana_frame_times=400, tau_evento=0.65, usar_modo_rapido=True)
     # test_phy_correlador(snr_db=-5) # Prueba a poner SNR negativo para ver cómo falla
 
-    # 4. Fase de IA (Pendiente)
-    # test_nn_decoder()
+    # 4. Fase de IA: detector ML (CNN 1D)
+    # Para entrenar el modelo:  python -m ml.generar_dataset --salida data/dataset_aloha
+    #                           python -m ml.entrenar_modelo --datos data/dataset_aloha --sin_wandb
+    # Para evaluar (sin checkpoint, pesos aleatorios):
+    # test_protocolo_comun_neuronal(usar_modo_rapido=True)
+    # Para evaluar con el modelo entrenado:
+    # test_protocolo_comun_neuronal(ruta_checkpoint='checkpoints/mejor-....ckpt', usar_modo_rapido=True)
