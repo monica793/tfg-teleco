@@ -312,3 +312,127 @@ def plot_roc_familia_por_snr(curvas_por_snr, ruta_salida=None, carga_G=None):
         plt.savefig(ruta_salida, dpi=150)
         print(f"Familia ROC guardada en {ruta_salida}")
     plt.show()
+
+
+def plot_roc_4panel_comparativa(curvas_por_condicion, ruta_salida=None):
+    """
+    Figura única 2×2 con curvas ROC del correlador vs CNN para 4 condiciones (G,SNR).
+
+    Parámetros
+    ----------
+    curvas_por_condicion : dict con claves (G, SNR) y valores dict:
+        {
+          'fpr_corr', 'tpr_corr', 'auc_corr',
+          'fpr_ml',   'tpr_ml',   'auc_ml',
+          'titulo': str  (etiqueta del subplot)
+        }
+    ruta_salida : str opcional — ruta donde guardar la figura.
+    """
+    condiciones = list(curvas_por_condicion.keys())
+    if len(condiciones) != 4:
+        raise ValueError("Se necesitan exactamente 4 condiciones para la figura 2×2.")
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    axes_flat = axes.flatten()
+
+    for ax, cond in zip(axes_flat, condiciones):
+        c = curvas_por_condicion[cond]
+
+        fpr_corr = np.asarray(c["fpr_corr"], dtype=float).ravel()
+        tpr_corr = np.asarray(c["tpr_corr"], dtype=float).ravel()
+        fpr_ml   = np.asarray(c["fpr_ml"],   dtype=float).ravel()
+        tpr_ml   = np.asarray(c["tpr_ml"],   dtype=float).ravel()
+
+        # Ordenar por FPR ascendente para plot correcto
+        ord_corr = np.argsort(fpr_corr)
+        ord_ml   = np.argsort(fpr_ml)
+
+        ax.plot(fpr_corr[ord_corr], tpr_corr[ord_corr],
+                linewidth=2.0, color="royalblue",
+                label=f"Correlador (AUC={float(c['auc_corr']):.3f})")
+        ax.plot(fpr_ml[ord_ml], tpr_ml[ord_ml],
+                linewidth=2.0, color="darkorange",
+                label=f"CNN 1D (AUC={float(c['auc_ml']):.3f})")
+        ax.plot([0, 1], [0, 1], linestyle="--", color="gray",
+                linewidth=1.0, label="Azar")
+
+        ax.set_title(c.get("titulo", str(cond)), fontsize=11)
+        ax.set_xlabel("FPR")
+        ax.set_ylabel("TPR")
+        ax.set_xlim(0.0, 1.0)
+        ax.set_ylim(0.0, 1.05)
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+
+    fig.suptitle("Comparativa ROC: Correlador vs CNN 1D (protocolo congelado)",
+                 fontsize=13, fontweight="bold")
+    plt.tight_layout()
+
+    if ruta_salida is not None:
+        os.makedirs(os.path.dirname(ruta_salida), exist_ok=True)
+        plt.savefig(ruta_salida, dpi=150)
+        print(f"Figura 4-panel ROC guardada en {ruta_salida}")
+    plt.show()
+
+
+def plot_roc_comparativa_correlador_vs_ml(
+    fpr_corr,
+    tpr_corr,
+    auc_corr,
+    fpr_ml,
+    tpr_ml,
+    auc_ml,
+    ruta_salida=None,
+    carga_G=None,
+    snr_db=None,
+):
+    """
+    Dibuja en la misma figura la ROC del correlador y la del detector ML.
+    """
+    fpr_corr = np.asarray(fpr_corr, dtype=float).ravel()
+    tpr_corr = np.asarray(tpr_corr, dtype=float).ravel()
+    fpr_ml = np.asarray(fpr_ml, dtype=float).ravel()
+    tpr_ml = np.asarray(tpr_ml, dtype=float).ravel()
+
+    if fpr_corr.size != tpr_corr.size:
+        raise ValueError("fpr_corr y tpr_corr deben tener la misma longitud")
+    if fpr_ml.size != tpr_ml.size:
+        raise ValueError("fpr_ml y tpr_ml deben tener la misma longitud")
+
+    ord_corr = np.argsort(fpr_corr)
+    ord_ml = np.argsort(fpr_ml)
+
+    plt.figure(figsize=(7.5, 6.2))
+    plt.plot(
+        fpr_corr[ord_corr],
+        tpr_corr[ord_corr],
+        linewidth=2.0,
+        color="royalblue",
+        label=f"Correlador (AUC={float(auc_corr):.3f})",
+    )
+    plt.plot(
+        fpr_ml[ord_ml],
+        tpr_ml[ord_ml],
+        linewidth=2.0,
+        color="darkorange",
+        label=f"Red neuronal (AUC={float(auc_ml):.3f})",
+    )
+    plt.plot([0, 1], [0, 1], linestyle="--", color="gray", linewidth=1.0, label="Azar")
+
+    titulo = "Comparativa ROC: correlador vs red neuronal"
+    if carga_G is not None and snr_db is not None:
+        titulo += f" (G={float(carga_G):g}, SNR={float(snr_db):g} dB)"
+    plt.title(titulo)
+    plt.xlabel("FPR")
+    plt.ylabel("TPR")
+    plt.xlim(0.0, 1.0)
+    plt.ylim(0.0, 1.0)
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+
+    if ruta_salida is not None:
+        os.makedirs(os.path.dirname(ruta_salida), exist_ok=True)
+        plt.savefig(ruta_salida, dpi=150)
+        print(f"Comparativa ROC guardada en {ruta_salida}")
+    plt.show()

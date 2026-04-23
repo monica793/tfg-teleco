@@ -19,6 +19,7 @@ from pipeline.escenario_phy import (
     barrer_grid_protocolo_correlador,
     ejecutar_monte_carlo_receptor_correlador,
     ejecutar_monte_carlo_roc_correlador,
+    ejecutar_monte_carlo_roc_neuronal,
     generar_escenario_phy,
     ejecutar_receptor_neuronal,
 )
@@ -36,6 +37,8 @@ from pipeline.protocolo_evaluacion import (
 )
 from pipeline.visualization import (
     plot_colision_correlador,
+    plot_roc_comparativa_correlador_vs_ml,
+    plot_roc_4panel_comparativa,
     plot_deteccion_correlador_awgn,
     plot_pure_aloha,
     plot_roc_familia_por_snr,
@@ -269,6 +272,182 @@ def test_roc_correlador(carga_G=0.4, ventana_frame_times=400, snr_db=6.0):
     return roc
 
 
+def test_roc_comparativa_correlador_vs_neuronal(
+    ruta_checkpoint,
+    carga_G=0.4,
+    ventana_frame_times=400,
+    snr_db=6.0,
+    usar_modo_rapido=True,
+):
+    """
+    Genera y dibuja en una sola figura la ROC del correlador y la ROC del
+    detector neuronal bajo la misma condición (G,SNR) y el mismo protocolo.
+    """
+    if ruta_checkpoint is None or not os.path.exists(ruta_checkpoint):
+        raise FileNotFoundError(
+            "Debes indicar un checkpoint válido de la red neuronal en `ruta_checkpoint`."
+        )
+
+    dispositivo = "cuda" if torch.cuda.is_available() else "cpu"
+    modelo = cargar_modelo_desde_checkpoint(ruta_checkpoint, map_location=dispositivo)
+    modelo.eval()
+
+    num_iter = NUM_ITERACIONES_MC_RAPIDO if usar_modo_rapido else NUM_ITERACIONES_MC
+    taus = np.linspace(0.0, 1.0, 101, dtype=float)
+
+    roc_corr = ejecutar_monte_carlo_roc_correlador(
+        carga_G=carga_G,
+        ventana_frame_times=ventana_frame_times,
+        snr_db=snr_db,
+        tolerancia_muestras=TOLERANCIA_MUESTRAS,
+        num_iteraciones=num_iter,
+        semilla_base=SEMILLA_BASE,
+        num_bits_pre=NUM_BITS_PRE,
+        num_bits_datos=NUM_BITS_DATOS,
+        taus=taus,
+    )
+
+    roc_ml = ejecutar_monte_carlo_roc_neuronal(
+        carga_G=carga_G,
+        ventana_frame_times=ventana_frame_times,
+        snr_db=snr_db,
+        tolerancia_muestras=TOLERANCIA_MUESTRAS,
+        num_iteraciones=num_iter,
+        modelo=modelo,
+        semilla_base=SEMILLA_BASE,
+        num_bits_pre=NUM_BITS_PRE,
+        num_bits_datos=NUM_BITS_DATOS,
+        dispositivo=dispositivo,
+        stride=1,
+        long_ventana=128,
+        taus=taus,
+    )
+
+    print("=" * 70)
+    print("ROC COMPARATIVA — Correlador vs Red Neuronal")
+    print("=" * 70)
+    print(f"G={carga_G}, SNR={snr_db} dB, MC={num_iter}")
+    print(f"AUC correlador:    {roc_corr['auc_media']:.4f}")
+    print(f"AUC red neuronal:  {roc_ml['auc_media']:.4f}")
+    print("=" * 70)
+
+    ruta = os.path.join(FIGURES, "roc_comparativa_correlador_vs_ml.png")
+    plot_roc_comparativa_correlador_vs_ml(
+        fpr_corr=roc_corr["fpr_media"],
+        tpr_corr=roc_corr["tpr_media"],
+        auc_corr=roc_corr["auc_media"],
+        fpr_ml=roc_ml["fpr_media"],
+        tpr_ml=roc_ml["tpr_media"],
+        auc_ml=roc_ml["auc_media"],
+        ruta_salida=ruta,
+        carga_G=carga_G,
+        snr_db=snr_db,
+    )
+
+    return {"roc_correlador": roc_corr, "roc_ml": roc_ml}
+
+
+def test_roc_4panel_comparativa(
+    ruta_checkpoint: str,
+    ventana_frame_times: int = 400,
+    usar_modo_rapido: bool = True,
+):
+    """
+    Genera una figura 2×2 con la ROC del correlador y la CNN en 4 condiciones:
+      1. G=0.2, SNR=10 dB  — Escenario fácil
+      2. G=0.2, SNR=0  dB  — Límite de ruido
+      3. G=0.8, SNR=10 dB  — Límite de colisiones
+      4. G=0.8, SNR=0  dB  — Escenario infernal
+
+    Ambos receptores se evalúan sobre los mismos escenarios (protocolo congelado).
+    """
+    if not os.path.exists(ruta_checkpoint):
+        raise FileNotFoundError(f"Checkpoint no encontrado: {ruta_checkpoint}")
+
+    dispositivo = "cuda" if torch.cuda.is_available() else "cpu"
+    modelo = cargar_modelo_desde_checkpoint(ruta_checkpoint, map_location=dispositivo)
+    modelo.eval()
+    print(f"[ROC 4-panel] Modelo cargado desde: {ruta_checkpoint}")
+
+    num_iter = NUM_ITERACIONES_MC_RAPIDO if usar_modo_rapido else NUM_ITERACIONES_MC
+    taus     = np.linspace(0.0, 1.0, NUM_PUNTOS_ROC)
+
+    # Las 4 condiciones del experimento comparativo
+    condiciones = [
+        (0.2, 10.0, "G=0.2, SNR=10 dB — Escenario fácil"),
+        (0.2,  0.0, "G=0.2, SNR=0 dB  — Límite de ruido"),
+        (0.8, 10.0, "G=0.8, SNR=10 dB — Límite de colisiones"),
+        (0.8,  0.0, "G=0.8, SNR=0 dB  — Escenario infernal"),
+    ]
+
+    curvas_por_condicion = {}
+
+    for g, snr, titulo in condiciones:
+        print(f"  Calculando ROC: G={g}, SNR={snr} dB ...", end=" ", flush=True)
+
+        # ROC del correlador
+        roc_corr = ejecutar_monte_carlo_roc_correlador(
+            carga_G=g,
+            ventana_frame_times=ventana_frame_times,
+            snr_db=snr,
+            tolerancia_muestras=TOLERANCIA_MUESTRAS,
+            num_iteraciones=num_iter,
+            semilla_base=SEMILLA_BASE,
+            num_bits_pre=NUM_BITS_PRE,
+            num_bits_datos=NUM_BITS_DATOS,
+            taus=taus,
+        )
+
+        # ROC de la CNN (mismo escenario, misma definición de positivos)
+        roc_ml = ejecutar_monte_carlo_roc_neuronal(
+            carga_G=g,
+            ventana_frame_times=ventana_frame_times,
+            snr_db=snr,
+            tolerancia_muestras=TOLERANCIA_MUESTRAS,
+            num_iteraciones=num_iter,
+            modelo=modelo,
+            semilla_base=SEMILLA_BASE,
+            num_bits_pre=NUM_BITS_PRE,
+            num_bits_datos=NUM_BITS_DATOS,
+            dispositivo=dispositivo,
+            stride=1,
+            long_ventana=128,
+            taus=taus,
+        )
+
+        curvas_por_condicion[(g, snr)] = {
+            "fpr_corr": roc_corr["fpr_media"],
+            "tpr_corr": roc_corr["tpr_media"],
+            "auc_corr": roc_corr["auc_media"],
+            "fpr_ml":   roc_ml["fpr_media"],
+            "tpr_ml":   roc_ml["tpr_media"],
+            "auc_ml":   roc_ml["auc_media"],
+            "titulo":   titulo,
+        }
+        print(f"AUC Corr={roc_corr['auc_media']:.3f}  AUC CNN={roc_ml['auc_media']:.3f}")
+
+    # Tabla resumen en consola
+    print("\n" + "=" * 72)
+    print("COMPARATIVA ROC 4 CONDICIONES — Correlador vs CNN 1D")
+    print("=" * 72)
+    print(f"{'Condición':<38} {'AUC Corr':>10} {'AUC CNN':>10} {'Δ AUC':>8}")
+    print("-" * 72)
+    for (g, snr), c in curvas_por_condicion.items():
+        delta = c["auc_ml"] - c["auc_corr"]
+        signo = "+" if delta >= 0 else ""
+        print(f"  G={g}, SNR={snr:>4.0f} dB  "
+              f"{c['titulo'].split('—')[1].strip():<20}"
+              f"{c['auc_corr']:>10.4f}"
+              f"{c['auc_ml']:>10.4f}"
+              f"  {signo}{delta:.4f}")
+    print("=" * 72)
+
+    ruta = os.path.join(FIGURES, "roc_4panel_comparativa.png")
+    plot_roc_4panel_comparativa(curvas_por_condicion, ruta_salida=ruta)
+
+    return curvas_por_condicion
+
+
 def test_protocolo_comun_correlador(
     ventana_frame_times=400,
     tau_evento=0.65,
@@ -458,15 +637,35 @@ if __name__ == '__main__':
     # 3b. Integración ALOHA → PHY → correlador (Monte Carlo)
     #prueba_integracion_total(carga_G=0.4)
     # ROC canónica (por índice) para todos los umbrales tau en [0,1]
-    test_roc_correlador(carga_G=0.4, ventana_frame_times=400, snr_db=6.0)
+    # test_roc_correlador(carga_G=0.4, ventana_frame_times=400, snr_db=6.0)
+    #  test_roc_comparativa_correlador_vs_neuronal(
+    #     ruta_checkpoint="checkpoints/mejor-epoch=17-val_loss=0.0210.ckpt",
+    #     carga_G=0.4,
+    #     ventana_frame_times=400,
+    #     snr_db=6.0,
+    #     usar_modo_rapido=True,
+    # ) 
     # Protocolo común congelado (tabla + familia ROC); usar_modo_rapido=True para iterar rápido
     # test_protocolo_comun_correlador(ventana_frame_times=400, tau_evento=0.65, usar_modo_rapido=True)
     # test_phy_correlador(snr_db=-5) # Prueba a poner SNR negativo para ver cómo falla
 
     # 4. Fase de IA: detector ML (CNN 1D)
-    # Para entrenar el modelo:  python -m ml.generar_dataset --salida data/dataset_aloha
-    #                           python -m ml.entrenar_modelo --datos data/dataset_aloha --sin_wandb
-    # Para evaluar (sin checkpoint, pesos aleatorios):
-    # test_protocolo_comun_neuronal(usar_modo_rapido=True)
-    # Para evaluar con el modelo entrenado:
-    # test_protocolo_comun_neuronal(ruta_checkpoint='checkpoints/mejor-....ckpt', usar_modo_rapido=True)
+    # ─────────────────────────────────────────────────────────────────────────
+    # Paso 1: generar dataset desde escenarios ALOHA reales
+    #   python -m ml.generar_dataset --salida data/dataset_aloha
+    #
+    # Paso 2: entrenar (Colab/GPU recomendado)
+    #   python -m ml.entrenar_modelo --datos data/dataset_aloha --sin_wandb
+    #
+    # Paso 3: tabla de métricas por evento en grid (G,SNR)
+    # test_protocolo_comun_neuronal(
+    #     ruta_checkpoint='checkpoints/mejor-epoch=17-val_loss=0.0210.ckpt',
+    #     usar_modo_rapido=True,
+    # )
+    #
+    # Paso 4: figura comparativa ROC 2×2 (4 condiciones)
+    # test_roc_4panel_comparativa(
+    #     ruta_checkpoint='checkpoints/mejor-epoch=17-val_loss=0.0210.ckpt',
+    #     usar_modo_rapido=True,
+    # )
+    pass

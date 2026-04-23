@@ -351,6 +351,76 @@ def ejecutar_receptor_neuronal(
     }
 
 
+def ejecutar_monte_carlo_roc_neuronal(
+    carga_G,
+    ventana_frame_times,
+    snr_db,
+    tolerancia_muestras,
+    num_iteraciones,
+    modelo,
+    semilla_base=0,
+    num_bits_pre=13,
+    num_bits_datos=20,
+    dispositivo="cpu",
+    stride=1,
+    long_ventana=128,
+    taus=None,
+):
+    """
+    ROC canónica por indice para el detector neuronal, promediada en Monte Carlo.
+
+    Usa `score_por_muestra` como estadístico de decisión (equivalente a corr_norm):
+    para cada tau, pred[mu] = 1{score[mu] >= tau}.
+    """
+    if taus is None:
+        taus = np.linspace(0.0, 1.0, 101, dtype=float)
+    else:
+        taus = np.asarray(taus, dtype=float).ravel()
+        if taus.size == 0:
+            raise ValueError("taus no puede ser vacío")
+
+    tpr_sum = np.zeros_like(taus, dtype=float)
+    fpr_sum = np.zeros_like(taus, dtype=float)
+    auc_sum = 0.0
+
+    for k in range(num_iteraciones):
+        esc = generar_escenario_phy(
+            carga_G,
+            ventana_frame_times,
+            snr_db,
+            num_bits_pre=num_bits_pre,
+            num_bits_datos=num_bits_datos,
+            semilla=semilla_base + k,
+        )
+        sal_ml = ejecutar_receptor_neuronal(
+            escenario=esc,
+            modelo=modelo,
+            umbral=0.5,  # no afecta a ROC; aquí solo se usa score_por_muestra
+            separacion_minima=num_bits_pre,
+            dispositivo=dispositivo,
+            stride=stride,
+            long_ventana=long_ventana,
+        )
+        roc = curva_roc_por_indice(
+            corr_norm=sal_ml["score_por_muestra"],
+            instantes_verdaderos=esc["instantes_llegada_muestras"],
+            tolerancia_muestras=tolerancia_muestras,
+            taus=taus,
+        )
+        tpr_sum += roc["tpr"]
+        fpr_sum += roc["fpr"]
+        auc_sum += roc["auc"]
+
+    n = max(1, int(num_iteraciones))
+    return {
+        "num_iteraciones": int(num_iteraciones),
+        "taus": taus,
+        "tpr_media": tpr_sum / n,
+        "fpr_media": fpr_sum / n,
+        "auc_media": float(auc_sum / n),
+    }
+
+
 def barrer_grid_protocolo_correlador(
     cargas_G,
     snrs_db,
