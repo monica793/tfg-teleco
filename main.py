@@ -32,6 +32,7 @@ from pipeline.protocolo_evaluacion import (
     NUM_BITS_PRE,
     NUM_ITERACIONES_MC,
     NUM_ITERACIONES_MC_RAPIDO,
+    NUM_PUNTOS_ROC,
     SEMILLA_BASE,
     TOLERANCIA_MUESTRAS,
 )
