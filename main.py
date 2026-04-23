@@ -352,6 +352,7 @@ def test_roc_4panel_comparativa(
     ruta_checkpoint: str,
     ventana_frame_times: int = 400,
     usar_modo_rapido: bool = True,
+    tolerancia_roc_muestras: int = 0,
 ):
     """
     Genera una figura 2×2 con la ROC del correlador y la CNN en 4 condiciones:
@@ -360,7 +361,13 @@ def test_roc_4panel_comparativa(
       3. G=0.8, SNR=10 dB  — Límite de colisiones
       4. G=0.8, SNR=0  dB  — Escenario infernal
 
-    Ambos receptores se evalúan sobre los mismos escenarios (protocolo congelado).
+    Ambos receptores se evalúan sobre los mismos escenarios.
+
+    Nota clave:
+      Para esta ROC por índice se usa por defecto tolerancia 0, coherente con el
+      entrenamiento de la CNN (diana central exacta, ±0). Si se usa tolerancia > 0,
+      la métrica favorece estadísticos anchos (p. ej. correlador) frente a salidas
+      más impulsivas en el índice exacto (CNN).
     """
     if not os.path.exists(ruta_checkpoint):
         raise FileNotFoundError(f"Checkpoint no encontrado: {ruta_checkpoint}")
@@ -391,7 +398,7 @@ def test_roc_4panel_comparativa(
             carga_G=g,
             ventana_frame_times=ventana_frame_times,
             snr_db=snr,
-            tolerancia_muestras=TOLERANCIA_MUESTRAS,
+            tolerancia_muestras=tolerancia_roc_muestras,
             num_iteraciones=num_iter,
             semilla_base=SEMILLA_BASE,
             num_bits_pre=NUM_BITS_PRE,
@@ -404,7 +411,7 @@ def test_roc_4panel_comparativa(
             carga_G=g,
             ventana_frame_times=ventana_frame_times,
             snr_db=snr,
-            tolerancia_muestras=TOLERANCIA_MUESTRAS,
+            tolerancia_muestras=tolerancia_roc_muestras,
             num_iteraciones=num_iter,
             modelo=modelo,
             semilla_base=SEMILLA_BASE,
