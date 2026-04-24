@@ -122,8 +122,9 @@ class DetectorALOHA(L.LightningModule):
             pred = (torch.sigmoid(logit) >= 0.5).float()
             acc = (pred == y).float().mean()
 
-        self.log(f"{etapa}_loss", loss, on_epoch=True, prog_bar=True)
-        self.log(f"{etapa}_acc", acc, on_epoch=True, prog_bar=True)
+        # Loguear por época (no por paso) para evitar saturar la salida en Colab.
+        self.log(f"{etapa}_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
+        self.log(f"{etapa}_acc", acc, on_step=False, on_epoch=True, prog_bar=True)
         return loss
 
     def training_step(self, batch, batch_idx):
@@ -204,8 +205,11 @@ def entrenar(
     trainer = L.Trainer(
         max_epochs=max_epochs,
         callbacks=callbacks,
-        logger=loggers if loggers else True,
-        log_every_n_steps=10,
+        # Sin WandB: desactivar logger para reducir overhead y ruido en notebook.
+        logger=loggers if loggers else False,
+        # Menos frecuencia de actualización de progreso para no saturar el navegador.
+        log_every_n_steps=200,
+        enable_model_summary=False,
         accelerator="auto",   # CPU local; GPU en Colab automáticamente
         devices=1,
     )
