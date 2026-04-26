@@ -12,6 +12,7 @@ from aloha.pure_aloha import simular_pure_aloha
 from pipeline.channel import canal_awgn_colision
 from pipeline.correlator_decoder import buscar_picos_preambulo, correlador
 from pipeline.metricas_receptor import (
+    curva_pr_por_indice,
     curva_roc_por_indice,
     evaluar_detecciones,
     metricas_evento_derivadas,
@@ -28,6 +29,8 @@ def generar_escenario_phy(
     semilla=None,
     margen_muestras=None,
     incluir_mascara_colision_mac=True,
+    aplicar_fase_aleatoria_por_paquete=True,
+    usar_preambulo=True,
 ):
     """
     Construye una realización: motor MAC (Pure ALOHA) + paquetes BPSK + canal AWGN con colisiones.
@@ -42,6 +45,10 @@ def generar_escenario_phy(
     semilla               : int opcional — fija random y numpy para reproducibilidad
     margen_muestras       : int opcional — cola de silencio al final del buffer RX
     incluir_mascara_colision_mac : si True, incluye colisión según MAC clásico (referencia TFG)
+    aplicar_fase_aleatoria_por_paquete : si True, aplica una fase global aleatoria
+        constante dentro de cada paquete (modelo de offset de fase por usuario/paquete)
+    usar_preambulo        : si True, paquete = [preámbulo | datos].
+                            Si False, paquete = [solo datos] (modo ciego para NN).
 
     Retorna
     -------
@@ -51,8 +58,16 @@ def generar_escenario_phy(
         np.random.seed(semilla)
         random.seed(semilla)
 
-    preambulo = generar_preambulo(num_bits=num_bits_pre)
-    paquete_ref = generar_paquete(preambulo, num_bits_datos=num_bits_datos)
+    if usar_preambulo:
+        preambulo = generar_preambulo(num_bits=num_bits_pre)
+        bits_datos_paquete = num_bits_datos
+    else:
+        preambulo = np.array([], dtype=np.complex128)
+        # Mantener longitud total constante (= num_bits_pre + num_bits_datos) para
+        # comparar detectores con la misma escala temporal de paquete.
+        bits_datos_paquete = num_bits_pre + num_bits_datos
+
+    paquete_ref = generar_paquete(preambulo, num_bits_datos=bits_datos_paquete)
     longitud_paquete_muestras = len(paquete_ref)
 
     if margen_muestras is None:
@@ -78,9 +93,16 @@ def generar_escenario_phy(
         colision_mac_clasica = None
 
     paquetes_y_tiempos = []
+    fases_paquetes_rad = []
     for _ in instantes_muestras:
-        paq = generar_paquete(preambulo, num_bits_datos=num_bits_datos)
+        paq = generar_paquete(preambulo, num_bits_datos=bits_datos_paquete)
+        if aplicar_fase_aleatoria_por_paquete:
+            fase = float(np.random.uniform(0.0, 2.0 * np.pi))
+            paq = paq.astype(np.complex128) * np.exp(1j * fase)
+        else:
+            fase = 0.0
         paquetes_y_tiempos.append((paq, _))
+        fases_paquetes_rad.append(fase)
 
     if len(instantes_muestras) == 0:
         longitud_total = max(1, int(ventana_frame_times * longitud_paquete_muestras) + margen_muestras)
@@ -106,6 +128,10 @@ def generar_escenario_phy(
         "ventana_frame_times": int(ventana_frame_times),
         "num_bits_pre": int(num_bits_pre),
         "num_bits_datos": int(num_bits_datos),
+        "usar_preambulo": bool(usar_preambulo),
+        "num_bits_datos_paquete": int(bits_datos_paquete),
+        "fases_paquetes_rad": np.asarray(fases_paquetes_rad, dtype=np.float64),
+        "aplicar_fase_aleatoria_por_paquete": bool(aplicar_fase_aleatoria_por_paquete),
     }
     if colision_mac_clasica is not None:
         escenario["colision_mac_clasica"] = np.asarray(colision_mac_clasica, dtype=bool)
@@ -122,6 +148,10 @@ def ejecutar_receptor_correlador(escenario, tau, separacion_minima):
     """
     senal_rx = escenario["senal_rx"]
     preambulo = escenario["preambulo"]
+    if len(preambulo) == 0:
+        raise ValueError(
+            "El correlador requiere preámbulo, pero el escenario fue generado con usar_preambulo=False."
+        )
     corr_norm = correlador(senal_rx, preambulo)
     picos = buscar_picos_preambulo(corr_norm, tau=tau, separacion_minima=separacion_minima)
     return {"instantes_detectados": picos, "corr_norm": corr_norm}
@@ -216,7 +246,7 @@ def ejecutar_monte_carlo_roc_correlador(
     """
     ROC canónica por indice del correlador, promediada en Monte Carlo.
 
-    Retorna FPR/TPR medios por umbral y AUC media.
+    Retorna ROC y PR medios por umbral, junto con AUC media.
     """
     if taus is None:
         taus = np.linspace(0.0, 1.0, 101, dtype=float)
@@ -227,7 +257,10 @@ def ejecutar_monte_carlo_roc_correlador(
 
     tpr_sum = np.zeros_like(taus, dtype=float)
     fpr_sum = np.zeros_like(taus, dtype=float)
-    auc_sum = 0.0
+    precision_sum = np.zeros_like(taus, dtype=float)
+    recall_sum = np.zeros_like(taus, dtype=float)
+    roc_auc_sum = 0.0
+    pr_auc_sum = 0.0
 
     for k in range(num_iteraciones):
         esc = generar_escenario_phy(
@@ -245,9 +278,18 @@ def ejecutar_monte_carlo_roc_correlador(
             tolerancia_muestras=tolerancia_muestras,
             taus=taus,
         )
+        pr = curva_pr_por_indice(
+            corr_norm=corr_norm,
+            instantes_verdaderos=esc["instantes_llegada_muestras"],
+            tolerancia_muestras=tolerancia_muestras,
+            taus=taus,
+        )
         tpr_sum += roc["tpr"]
         fpr_sum += roc["fpr"]
-        auc_sum += roc["auc"]
+        precision_sum += pr["precision"]
+        recall_sum += pr["recall"]
+        roc_auc_sum += roc["auc"]
+        pr_auc_sum += pr["pr_auc"]
 
     n = max(1, int(num_iteraciones))
     return {
@@ -255,7 +297,10 @@ def ejecutar_monte_carlo_roc_correlador(
         "taus": taus,
         "tpr_media": tpr_sum / n,
         "fpr_media": fpr_sum / n,
-        "auc_media": float(auc_sum / n),
+        "precision_media": precision_sum / n,
+        "recall_media": recall_sum / n,
+        "auc_media": float(roc_auc_sum / n),
+        "pr_auc_media": float(pr_auc_sum / n),
     }
 
 
@@ -365,9 +410,10 @@ def ejecutar_monte_carlo_roc_neuronal(
     stride=1,
     long_ventana=128,
     taus=None,
+    usar_preambulo=False,
 ):
     """
-    ROC canónica por indice para el detector neuronal, promediada en Monte Carlo.
+    ROC/PR por indice para el detector neuronal, promediadas en Monte Carlo.
 
     Usa `score_por_muestra` como estadístico de decisión (equivalente a corr_norm):
     para cada tau, pred[mu] = 1{score[mu] >= tau}.
@@ -381,7 +427,10 @@ def ejecutar_monte_carlo_roc_neuronal(
 
     tpr_sum = np.zeros_like(taus, dtype=float)
     fpr_sum = np.zeros_like(taus, dtype=float)
-    auc_sum = 0.0
+    precision_sum = np.zeros_like(taus, dtype=float)
+    recall_sum = np.zeros_like(taus, dtype=float)
+    roc_auc_sum = 0.0
+    pr_auc_sum = 0.0
 
     for k in range(num_iteraciones):
         esc = generar_escenario_phy(
@@ -391,12 +440,13 @@ def ejecutar_monte_carlo_roc_neuronal(
             num_bits_pre=num_bits_pre,
             num_bits_datos=num_bits_datos,
             semilla=semilla_base + k,
+            usar_preambulo=usar_preambulo,
         )
         sal_ml = ejecutar_receptor_neuronal(
             escenario=esc,
             modelo=modelo,
             umbral=0.5,  # no afecta a ROC; aquí solo se usa score_por_muestra
-            separacion_minima=num_bits_pre,
+            separacion_minima=num_bits_pre + num_bits_datos,
             dispositivo=dispositivo,
             stride=stride,
             long_ventana=long_ventana,
@@ -407,9 +457,18 @@ def ejecutar_monte_carlo_roc_neuronal(
             tolerancia_muestras=tolerancia_muestras,
             taus=taus,
         )
+        pr = curva_pr_por_indice(
+            corr_norm=sal_ml["score_por_muestra"],
+            instantes_verdaderos=esc["instantes_llegada_muestras"],
+            tolerancia_muestras=tolerancia_muestras,
+            taus=taus,
+        )
         tpr_sum += roc["tpr"]
         fpr_sum += roc["fpr"]
-        auc_sum += roc["auc"]
+        precision_sum += pr["precision"]
+        recall_sum += pr["recall"]
+        roc_auc_sum += roc["auc"]
+        pr_auc_sum += pr["pr_auc"]
 
     n = max(1, int(num_iteraciones))
     return {
@@ -417,7 +476,10 @@ def ejecutar_monte_carlo_roc_neuronal(
         "taus": taus,
         "tpr_media": tpr_sum / n,
         "fpr_media": fpr_sum / n,
-        "auc_media": float(auc_sum / n),
+        "precision_media": precision_sum / n,
+        "recall_media": recall_sum / n,
+        "auc_media": float(roc_auc_sum / n),
+        "pr_auc_media": float(pr_auc_sum / n),
     }
 
 
@@ -475,6 +537,7 @@ def barrer_grid_protocolo_correlador(
                     "precision": resumen_evento["precision"],
                     "f1": resumen_evento["f1"],
                     "auc": resumen_roc["auc_media"],
+                    "pr_auc": resumen_roc["pr_auc_media"],
                 }
             )
     return filas

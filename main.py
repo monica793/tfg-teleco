@@ -1,4 +1,4 @@
-
+import csv
 import os
 import numpy as np
 import torch
@@ -38,6 +38,7 @@ from pipeline.protocolo_evaluacion import (
 )
 from pipeline.visualization import (
     plot_colision_correlador,
+    plot_pr_comparativa_correlador_vs_ml,
     plot_roc_comparativa_correlador_vs_ml,
     plot_roc_4panel_comparativa,
     plot_deteccion_correlador_awgn,
@@ -322,14 +323,17 @@ def test_roc_comparativa_correlador_vs_neuronal(
         stride=1,
         long_ventana=128,
         taus=taus,
+        usar_preambulo=False,
     )
 
     print("=" * 70)
     print("ROC COMPARATIVA — Correlador vs Red Neuronal")
     print("=" * 70)
     print(f"G={carga_G}, SNR={snr_db} dB, MC={num_iter}")
-    print(f"AUC correlador:    {roc_corr['auc_media']:.4f}")
-    print(f"AUC red neuronal:  {roc_ml['auc_media']:.4f}")
+    print(f"ROC-AUC correlador:  {roc_corr['auc_media']:.4f}")
+    print(f"ROC-AUC red neuronal:{roc_ml['auc_media']:.4f}")
+    print(f"PR-AUC correlador:   {roc_corr['pr_auc_media']:.4f}")
+    print(f"PR-AUC red neuronal: {roc_ml['pr_auc_media']:.4f}")
     print("=" * 70)
 
     ruta = os.path.join(FIGURES, "roc_comparativa_correlador_vs_ml.png")
@@ -341,6 +345,18 @@ def test_roc_comparativa_correlador_vs_neuronal(
         tpr_ml=roc_ml["tpr_media"],
         auc_ml=roc_ml["auc_media"],
         ruta_salida=ruta,
+        carga_G=carga_G,
+        snr_db=snr_db,
+    )
+    ruta_pr = os.path.join(FIGURES, "pr_comparativa_correlador_vs_ml.png")
+    plot_pr_comparativa_correlador_vs_ml(
+        recall_corr=roc_corr["recall_media"],
+        precision_corr=roc_corr["precision_media"],
+        pr_auc_corr=roc_corr["pr_auc_media"],
+        recall_ml=roc_ml["recall_media"],
+        precision_ml=roc_ml["precision_media"],
+        pr_auc_ml=roc_ml["pr_auc_media"],
+        ruta_salida=ruta_pr,
         carga_G=carga_G,
         snr_db=snr_db,
     )
@@ -421,32 +437,46 @@ def test_roc_4panel_comparativa(
             stride=1,
             long_ventana=128,
             taus=taus,
+            usar_preambulo=False,
         )
 
         curvas_por_condicion[(g, snr)] = {
             "fpr_corr": roc_corr["fpr_media"],
             "tpr_corr": roc_corr["tpr_media"],
             "auc_corr": roc_corr["auc_media"],
+            "recall_corr": roc_corr["recall_media"],
+            "precision_corr": roc_corr["precision_media"],
+            "pr_auc_corr": roc_corr["pr_auc_media"],
             "fpr_ml":   roc_ml["fpr_media"],
             "tpr_ml":   roc_ml["tpr_media"],
             "auc_ml":   roc_ml["auc_media"],
+            "recall_ml": roc_ml["recall_media"],
+            "precision_ml": roc_ml["precision_media"],
+            "pr_auc_ml": roc_ml["pr_auc_media"],
             "titulo":   titulo,
         }
-        print(f"AUC Corr={roc_corr['auc_media']:.3f}  AUC CNN={roc_ml['auc_media']:.3f}")
+        print(
+            f"ROC-AUC Corr={roc_corr['auc_media']:.3f}  ROC-AUC CNN={roc_ml['auc_media']:.3f}  "
+            f"PR-AUC Corr={roc_corr['pr_auc_media']:.3f}  PR-AUC CNN={roc_ml['pr_auc_media']:.3f}"
+        )
 
     # Tabla resumen en consola
     print("\n" + "=" * 72)
     print("COMPARATIVA ROC 4 CONDICIONES — Correlador vs CNN 1D")
     print("=" * 72)
-    print(f"{'Condición':<38} {'AUC Corr':>10} {'AUC CNN':>10} {'Δ AUC':>8}")
+    print(
+        f"{'Condición':<34} {'ROC Corr':>9} {'ROC CNN':>9} {'PR Corr':>9} {'PR CNN':>9} {'ΔPR':>8}"
+    )
     print("-" * 72)
     for (g, snr), c in curvas_por_condicion.items():
-        delta = c["auc_ml"] - c["auc_corr"]
+        delta = c["pr_auc_ml"] - c["pr_auc_corr"]
         signo = "+" if delta >= 0 else ""
         print(f"  G={g}, SNR={snr:>4.0f} dB  "
               f"{c['titulo'].split('—')[1].strip():<20}"
-              f"{c['auc_corr']:>10.4f}"
-              f"{c['auc_ml']:>10.4f}"
+              f"{c['auc_corr']:>9.4f}"
+              f"{c['auc_ml']:>9.4f}"
+              f"{c['pr_auc_corr']:>9.4f}"
+              f"{c['pr_auc_ml']:>9.4f}"
               f"  {signo}{delta:.4f}")
     print("=" * 72)
 
@@ -482,18 +512,26 @@ def test_protocolo_comun_correlador(
     print("PROTOCOLO COMÚN (CONGELADO) — Tabla por (G,SNR)")
     print("=" * 108)
     print(
-        "  G   SNR  TP_media±std   FP_media±std   FN_media±std   Recall   Precision   F1     AUC"
+        "  G   SNR   Recall  Precision   F1   ROC-AUC  PR-AUC"
     )
     print("-" * 108)
     for f in filas:
         print(
             f"{f['G']:>3.1f} {f['SNR_dB']:>5.1f} "
-            f"{f['tp_media']:>6.2f}±{f['tp_std']:<5.2f} "
-            f"{f['fp_media']:>6.2f}±{f['fp_std']:<5.2f} "
-            f"{f['fn_media']:>6.2f}±{f['fn_std']:<5.2f} "
-            f"{f['recall']:>7.3f}   {f['precision']:>8.3f}  {f['f1']:>6.3f}  {f['auc']:>6.3f}"
+            f"{f['recall']:>7.3f}   {f['precision']:>8.3f}  {f['f1']:>6.3f}  "
+            f"{f['auc']:>7.3f}  {f['pr_auc']:>7.3f}"
         )
     print("=" * 108)
+    ruta_csv = os.path.join(FIGURES, "resumen_metricas_correlador.csv")
+    with open(ruta_csv, "w", newline="", encoding="utf-8") as fcsv:
+        writer = csv.DictWriter(
+            fcsv,
+            fieldnames=["G", "SNR_dB", "recall", "precision", "f1", "auc", "pr_auc"],
+        )
+        writer.writeheader()
+        for fila in filas:
+            writer.writerow({k: fila[k] for k in writer.fieldnames})
+    print(f"Resumen compacto guardado en: {ruta_csv}")
 
     # Figura obligatoria: familia ROC por SNR a G fijo (primer G del grid).
     g_ref = float(GRID_CARGA_G[0])
@@ -546,7 +584,7 @@ def test_protocolo_comun_neuronal(
     usar_modo_rapido  : si True, usa NUM_ITERACIONES_MC_RAPIDO.
     """
     dispositivo = "cuda" if torch.cuda.is_available() else "cpu"
-    separacion_minima = NUM_BITS_PRE   # misma que el correlador
+    separacion_minima = NUM_BITS_PRE + NUM_BITS_DATOS
 
     if ruta_checkpoint is not None and os.path.exists(ruta_checkpoint):
         modelo = cargar_modelo_desde_checkpoint(ruta_checkpoint, map_location=dispositivo)
@@ -573,6 +611,7 @@ def test_protocolo_comun_neuronal(
                     num_bits_pre=NUM_BITS_PRE,
                     num_bits_datos=NUM_BITS_DATOS,
                     semilla=SEMILLA_BASE + k,
+                    usar_preambulo=False,
                 )
                 sal_ml = ejecutar_receptor_neuronal(
                     escenario=esc,
@@ -597,6 +636,21 @@ def test_protocolo_comun_neuronal(
             fp_std = float(np.std(fp_hist, ddof=0))
             fn_std = float(np.std(fn_hist, ddof=0))
             derivadas = metricas_evento_derivadas(tp_m, fp_m, fn_m)
+            roc_ml = ejecutar_monte_carlo_roc_neuronal(
+                carga_G=float(g),
+                ventana_frame_times=ventana_frame_times,
+                snr_db=float(snr),
+                tolerancia_muestras=TOLERANCIA_MUESTRAS,
+                num_iteraciones=num_iter,
+                modelo=modelo,
+                semilla_base=SEMILLA_BASE,
+                num_bits_pre=NUM_BITS_PRE,
+                num_bits_datos=NUM_BITS_DATOS,
+                dispositivo=dispositivo,
+                stride=1,
+                long_ventana=128,
+                usar_preambulo=False,
+            )
 
             filas.append({
                 "G": float(g),
@@ -607,24 +661,34 @@ def test_protocolo_comun_neuronal(
                 "recall": derivadas["recall"],
                 "precision": derivadas["precision"],
                 "f1": derivadas["f1"],
+                "auc": roc_ml["auc_media"],
+                "pr_auc": roc_ml["pr_auc_media"],
             })
 
     print("=" * 108)
     print("PROTOCOLO COMÚN (CONGELADO) — Detector ML (CNN 1D)")
     print("=" * 108)
     print(
-        "  G   SNR  TP_media±std   FP_media±std   FN_media±std   Recall   Precision   F1"
+        "  G   SNR   Recall  Precision   F1   ROC-AUC  PR-AUC"
     )
     print("-" * 108)
     for f in filas:
         print(
             f"{f['G']:>3.1f} {f['SNR_dB']:>5.1f} "
-            f"{f['tp_media']:>6.2f}±{f['tp_std']:<5.2f} "
-            f"{f['fp_media']:>6.2f}±{f['fp_std']:<5.2f} "
-            f"{f['fn_media']:>6.2f}±{f['fn_std']:<5.2f} "
-            f"{f['recall']:>7.3f}   {f['precision']:>8.3f}  {f['f1']:>6.3f}"
+            f"{f['recall']:>7.3f}   {f['precision']:>8.3f}  {f['f1']:>6.3f}  "
+            f"{f['auc']:>7.3f}  {f['pr_auc']:>7.3f}"
         )
     print("=" * 108)
+    ruta_csv = os.path.join(FIGURES, "resumen_metricas_ml.csv")
+    with open(ruta_csv, "w", newline="", encoding="utf-8") as fcsv:
+        writer = csv.DictWriter(
+            fcsv,
+            fieldnames=["G", "SNR_dB", "recall", "precision", "f1", "auc", "pr_auc"],
+        )
+        writer.writeheader()
+        for fila in filas:
+            writer.writerow({k: fila[k] for k in writer.fieldnames})
+    print(f"Resumen compacto guardado en: {ruta_csv}")
 
     return filas
 

@@ -436,3 +436,65 @@ def plot_roc_comparativa_correlador_vs_ml(
         plt.savefig(ruta_salida, dpi=150)
         print(f"Comparativa ROC guardada en {ruta_salida}")
     plt.show()
+
+
+def plot_pr_comparativa_correlador_vs_ml(
+    recall_corr,
+    precision_corr,
+    pr_auc_corr,
+    recall_ml,
+    precision_ml,
+    pr_auc_ml,
+    ruta_salida=None,
+    carga_G=None,
+    snr_db=None,
+):
+    """
+    Dibuja en la misma figura la curva Precision-Recall del correlador y la de la CNN.
+    """
+    recall_corr = np.asarray(recall_corr, dtype=float).ravel()
+    precision_corr = np.asarray(precision_corr, dtype=float).ravel()
+    recall_ml = np.asarray(recall_ml, dtype=float).ravel()
+    precision_ml = np.asarray(precision_ml, dtype=float).ravel()
+
+    if recall_corr.size != precision_corr.size:
+        raise ValueError("recall_corr y precision_corr deben tener la misma longitud")
+    if recall_ml.size != precision_ml.size:
+        raise ValueError("recall_ml y precision_ml deben tener la misma longitud")
+
+    ord_corr = np.argsort(recall_corr)
+    ord_ml = np.argsort(recall_ml)
+
+    plt.figure(figsize=(7.5, 6.2))
+    plt.plot(
+        recall_corr[ord_corr],
+        precision_corr[ord_corr],
+        linewidth=2.0,
+        color="royalblue",
+        label=f"Correlador (PR-AUC={float(pr_auc_corr):.3f})",
+    )
+    plt.plot(
+        recall_ml[ord_ml],
+        precision_ml[ord_ml],
+        linewidth=2.0,
+        color="darkorange",
+        label=f"Red neuronal (PR-AUC={float(pr_auc_ml):.3f})",
+    )
+
+    titulo = "Comparativa Precision-Recall: correlador vs red neuronal"
+    if carga_G is not None and snr_db is not None:
+        titulo += f" (G={float(carga_G):g}, SNR={float(snr_db):g} dB)"
+    plt.title(titulo)
+    plt.xlabel("Recall")
+    plt.ylabel("Precision")
+    plt.xlim(0.0, 1.0)
+    plt.ylim(0.0, 1.0)
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+
+    if ruta_salida is not None:
+        os.makedirs(os.path.dirname(ruta_salida), exist_ok=True)
+        plt.savefig(ruta_salida, dpi=150)
+        print(f"Comparativa PR guardada en {ruta_salida}")
+    plt.show()

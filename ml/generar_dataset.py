@@ -181,6 +181,7 @@ def generar_dataset_desde_escenarios(
                     num_bits_pre=NUM_BITS_PRE,
                     num_bits_datos=NUM_BITS_DATOS,
                     semilla=semilla_k,
+                    usar_preambulo=False,
                 )
 
                 X_k, Y_k = _extraer_ventanas_y_etiquetas(

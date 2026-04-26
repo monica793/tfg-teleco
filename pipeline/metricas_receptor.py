@@ -182,3 +182,71 @@ def curva_roc_por_indice(
         "num_positivos": positivos,
         "num_negativos": negativos,
     }
+
+
+def curva_pr_por_indice(
+    corr_norm,
+    instantes_verdaderos,
+    tolerancia_muestras,
+    taus=None,
+):
+    """
+    Curva Precision-Recall a nivel de indice del estadístico temporal.
+
+    Para cada umbral tau:
+      pred[mu] = 1{corr_norm[mu] >= tau}
+      true[mu] = 1 si mu está en ±tol de algun instante verdadero
+    """
+    c = np.asarray(corr_norm, dtype=float).ravel()
+    if c.size == 0:
+        raise ValueError("corr_norm no puede ser vacío")
+
+    if taus is None:
+        taus = np.linspace(0.0, 1.0, 101, dtype=float)
+    else:
+        taus = np.asarray(taus, dtype=float).ravel()
+        if taus.size == 0:
+            raise ValueError("taus no puede ser vacío")
+
+    y_true = construir_mascara_positivos_correlacion(
+        longitud_corr=c.size,
+        instantes_verdaderos=instantes_verdaderos,
+        tolerancia_muestras=tolerancia_muestras,
+    )
+
+    precision = np.zeros_like(taus, dtype=float)
+    recall = np.zeros_like(taus, dtype=float)
+    tp = np.zeros_like(taus, dtype=np.int64)
+    fp = np.zeros_like(taus, dtype=np.int64)
+    fn = np.zeros_like(taus, dtype=np.int64)
+
+    positivos = int(np.sum(y_true))
+    for i, tau in enumerate(taus):
+        y_pred = c >= float(tau)
+        tp_i = int(np.sum(y_pred & y_true))
+        fp_i = int(np.sum(y_pred & ~y_true))
+        fn_i = int(np.sum(~y_pred & y_true))
+
+        tp[i] = tp_i
+        fp[i] = fp_i
+        fn[i] = fn_i
+
+        precision[i] = tp_i / max(1, tp_i + fp_i)
+        recall[i] = tp_i / max(1, positivos)
+
+    # AUC(PR): integrar precision en función de recall creciente.
+    orden = np.argsort(recall)
+    recall_ord = recall[orden]
+    precision_ord = precision[orden]
+    pr_auc = float(np.trapz(precision_ord, recall_ord))
+
+    return {
+        "taus": taus,
+        "precision": precision,
+        "recall": recall,
+        "pr_auc": pr_auc,
+        "tp": tp,
+        "fp": fp,
+        "fn": fn,
+        "num_positivos": positivos,
+    }
