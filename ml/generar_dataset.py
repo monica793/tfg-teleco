@@ -277,6 +277,8 @@ def guardar_dataset(
     ventana_frame_times: int = 50,
     ratio_undersampling: int = RATIO_UNDERSAMPLING,
     semilla_base: int = SEMILLA_BASE,
+    hard_neg_radius: int = HARD_NEG_RADIUS,
+    hard_neg_weight: float = HARD_NEG_WEIGHT,
 ) -> None:
     """
     Genera y guarda el dataset en formato .npy en el directorio especificado.
@@ -291,6 +293,8 @@ def guardar_dataset(
         ventana_frame_times=ventana_frame_times,
         ratio_undersampling=ratio_undersampling,
         semilla_base=semilla_base,
+        hard_neg_radius=hard_neg_radius,
+        hard_neg_weight=hard_neg_weight,
     )
 
     np.save(os.path.join(directorio_salida, "X_train.npy"), X_train)
