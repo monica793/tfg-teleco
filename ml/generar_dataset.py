@@ -325,6 +325,11 @@ if __name__ == "__main__":
                         help="Duración de cada escenario en frame times")
     parser.add_argument("--ratio_undersample", type=int,   default=RATIO_UNDERSAMPLING)
     parser.add_argument("--semilla",           type=int,   default=SEMILLA_BASE)
+    parser.add_argument("--hard_neg_radius",   type=int,   default=HARD_NEG_RADIUS,
+                        help="Radio de hard negatives en muestras. "
+                             "Recomendado: 5 para modelo IQ, 8 para modelo energia.")
+    parser.add_argument("--hard_neg_weight",   type=float, default=HARD_NEG_WEIGHT,
+                        help="Peso extra de hard negatives en la pérdida. Default: 1.5")
     args = parser.parse_args()
 
     guardar_dataset(
@@ -334,4 +339,6 @@ if __name__ == "__main__":
         ventana_frame_times=args.ventana_ft,
         ratio_undersampling=args.ratio_undersample,
         semilla_base=args.semilla,
+        hard_neg_radius=args.hard_neg_radius,
+        hard_neg_weight=args.hard_neg_weight,
     )

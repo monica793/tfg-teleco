@@ -18,8 +18,9 @@ Motivación:
 Arquitectura:
   Preproceso : IQ (N,2,128) → energía media por segmento (N, N_SEGS)
   Normaliza  : divide por la media de energía de la ventana
-  FC1        : Linear(N_SEGS, 32) + ReLU + Dropout
-  FC2        : Linear(32, 1) → logit escalar
+  FC1        : Linear(N_SEGS, 128) + ReLU + Dropout
+  FC2        : Linear(128, 64)    + ReLU + Dropout
+  FC3        : Linear(64, 1)      → logit escalar
 
   Con N_SEGS=16 (segmentos de 8 muestras), la resolución temporal es 8 muestras,
   frente a las ~128 muestras de meseta del modelo IQ.
@@ -45,10 +46,13 @@ class ModeloCNNEnergia(nn.Module):
     def __init__(self, dropout: float = 0.3):
         super().__init__()
         self.cabeza = nn.Sequential(
-            nn.Linear(self.N_SEGS, 32),
+            nn.Linear(self.N_SEGS, 128),
             nn.ReLU(),
             nn.Dropout(p=dropout),
-            nn.Linear(32, 1),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Dropout(p=dropout),
+            nn.Linear(64, 1),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

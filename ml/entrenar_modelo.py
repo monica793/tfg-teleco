@@ -126,11 +126,13 @@ class DetectorALOHA(L.LightningModule):
     Scheduler: ReduceLROnPlateau sobre val_loss (factor 0.5, paciencia 5 épocas).
     """
 
-    def __init__(self, lr: float = 1e-3, dropout: float = 0.3, tipo_modelo: str = "iq"):
+    def __init__(self, lr: float = 1e-3, dropout: float = 0.3, tipo_modelo: str = "iq", pos_weight: float = 1.0):
         super().__init__()
         self.save_hyperparameters()
         clase_modelo = MODELOS_DISPONIBLES.get(tipo_modelo, ModeloCNN)
         self.modelo = clase_modelo(dropout=dropout)
+        # pos_weight registrado como buffer para moverse automáticamente a GPU/CPU
+        self.register_buffer("pw", torch.tensor([float(pos_weight)]))
         self.criterio = nn.BCEWithLogitsLoss(reduction="none")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -139,8 +141,10 @@ class DetectorALOHA(L.LightningModule):
     def _paso_comun(self, batch, etapa: str):
         x, y, w = batch
         logit = self(x).squeeze(1)       # (N,)
+        # pos_weight amplifica el gradiente de los positivos
+        pw_per_sample = torch.where(y > 0.5, self.pw.expand_as(y), torch.ones_like(y))
         loss_vec = self.criterio(logit, y)
-        loss = (loss_vec * w).sum() / torch.clamp(w.sum(), min=1e-8)
+        loss = (loss_vec * w * pw_per_sample).sum() / torch.clamp((w * pw_per_sample).sum(), min=1e-8)
 
         with torch.no_grad():
             pred = (torch.sigmoid(logit) >= 0.5).float()
@@ -183,6 +187,7 @@ def entrenar(
     proyecto_wandb: str = "tfg-aloha-detector",
     num_workers: int = 0,
     tipo_modelo: str = "iq",
+    pos_weight: float = 1.0,
 ):
     """
     Lanza el entrenamiento completo con PyTorch Lightning.
@@ -205,7 +210,7 @@ def entrenar(
         num_workers=num_workers,
     )
 
-    modelo_lightning = DetectorALOHA(lr=lr, dropout=dropout, tipo_modelo=tipo_modelo)
+    modelo_lightning = DetectorALOHA(lr=lr, dropout=dropout, tipo_modelo=tipo_modelo, pos_weight=pos_weight)
 
     callbacks = [
         ModelCheckpoint(
@@ -265,6 +270,9 @@ if __name__ == "__main__":
     parser.add_argument("--modelo", type=str, default="iq",
                         choices=list(MODELOS_DISPONIBLES.keys()),
                         help="Arquitectura: 'iq' (ModeloCNN original) o 'energia' (ModeloCNNEnergia)")
+    parser.add_argument("--pos_weight", type=float, default=1.0,
+                        help="Peso de los positivos en la pérdida (>1 fuerza más detecciones). "
+                             "Recomendado: 10.0 para energia, 1.0 para iq con hard negatives.")
     args = parser.parse_args()
 
     entrenar(
@@ -277,4 +285,5 @@ if __name__ == "__main__":
         usar_wandb=not args.sin_wandb,
         num_workers=args.workers,
         tipo_modelo=args.modelo,
+        pos_weight=args.pos_weight,
     )
