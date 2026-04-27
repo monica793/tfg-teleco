@@ -50,7 +50,7 @@ DIANA              = LONG_VENTANA // 2  # muestra 64: centro de la ventana
 TOLERANCIA_LABEL   = 0                  # ±0 en entrenamiento (detección exacta)
 RATIO_UNDERSAMPLING = 10                # negativos guardados por cada positivo
 HARD_NEG_RADIUS = 5                     # vecindad temporal "difícil" (muestras)
-HARD_NEG_WEIGHT = 3.0                   # penalización extra en pérdida
+HARD_NEG_WEIGHT = 1.5                   # penalización extra en pérdida
 
 
 # ---------------------------------------------------------------------------

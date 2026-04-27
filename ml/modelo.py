@@ -10,11 +10,15 @@ numérica. En inferencia se aplica sigmoid para obtener un score en [0, 1]
 equivalente a la probabilidad de inicio de paquete.
 
 Arquitectura:
-  Bloque 1: Conv1d(2→16,  kernel=7, pad=3) + ReLU → (N, 16, 128)
-  Bloque 2: Conv1d(16→32, kernel=5, pad=2) + ReLU → (N, 32, 128)
-  Flatten  : (N, 32*128) = (N, 4096)
-  FC1      : Linear(1024, 64) + ReLU + Dropout(0.3)
+  Bloque 1: Conv1d(2→16,  kernel=7, pad=3) + ReLU + MaxPool1d(2) → (N, 16, 64)
+  Bloque 2: Conv1d(16→32, kernel=5, pad=2) + ReLU               → (N, 32, 64)
+  Flatten  : (N, 32*64) = (N, 2048)
+  FC1      : Linear(2048, 64) + ReLU + Dropout(0.3)
   FC2      : Linear(64, 1)   → logit escalar
+
+  El pooling se mantiene solo en el primer bloque para ampliar el campo
+  receptivo y estabilizar el aprendizaje, pero se elimina en el segundo
+  bloque para preservar resolución temporal fina en las capas finales.
 """
 
 import torch
@@ -28,8 +32,9 @@ class ModeloCNN(nn.Module):
     Atributos
     ----------
     bloques_conv : nn.Sequential
-        Dos bloques convolucionales con ReLU, sin pooling para preservar
-        resolución temporal muestra a muestra.
+        Dos bloques convolucionales con ReLU. Solo el primer bloque tiene
+        MaxPool para ampliar campo receptivo; el segundo opera a resolución
+        completa para preservar precisión temporal fina.
     cabeza_densa : nn.Sequential
         Dos capas lineales con ReLU, Dropout y salida a logit escalar.
     """
@@ -41,16 +46,18 @@ class ModeloCNN(nn.Module):
         super().__init__()
 
         self.bloques_conv = nn.Sequential(
-            # Bloque 1: captura patrones de escala ~7 muestras
+            # Bloque 1: captura patrones de escala corta + pooling para campo receptivo
             nn.Conv1d(in_channels=2, out_channels=16, kernel_size=7, padding=3),
             nn.ReLU(),
-            # Bloque 2: captura patrones de mayor escala con más filtros
+            nn.MaxPool1d(kernel_size=2),      # 128 → 64
+
+            # Bloque 2: sin pooling para preservar resolución temporal fina
             nn.Conv1d(in_channels=16, out_channels=32, kernel_size=5, padding=2),
             nn.ReLU(),
         )
 
-        # Tamaño de la representación aplanada: 32 canales × 128 posiciones
-        dim_conv = 32 * self.LONG_VENTANA   # = 32 * 128 = 4096
+        # Tamaño de la representación aplanada: 32 canales × 64 posiciones
+        dim_conv = 32 * (self.LONG_VENTANA // 2)   # = 32 * 64 = 2048
 
         self.cabeza_densa = nn.Sequential(
             nn.Linear(dim_conv, 64),
@@ -69,8 +76,8 @@ class ModeloCNN(nn.Module):
         -------
         logit : (N, 1) — logit escalar por ventana.
         """
-        features = self.bloques_conv(x)          # (N, 32, 128)
-        features = features.flatten(start_dim=1) # (N, 4096)
+        features = self.bloques_conv(x)          # (N, 32, 64)
+        features = features.flatten(start_dim=1) # (N, 2048)
         return self.cabeza_densa(features)        # (N, 1)
 
 
