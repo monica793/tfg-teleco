@@ -21,6 +21,11 @@ Balanceo de clases:
   El tráfico ALOHA genera un desbalance brutal (~1 positivo cada L muestras).
   Se aplica undersampling de la clase negativa: por cada positivo se guardan
   como máximo RATIO_UNDERSAMPLING negativos.
+
+Hard negatives:
+  Las ventanas negativas cercanas al inicio real (|delta| <= HARD_NEG_RADIUS,
+  excluyendo delta=0) se conservan de forma preferente y reciben un peso de
+  pérdida mayor para forzar precisión temporal fina.
 """
 
 import argparse
@@ -44,6 +49,8 @@ LONG_VENTANA       = LONG_VENTANA_CNN   # 128 muestras = 2^7
 DIANA              = LONG_VENTANA // 2  # muestra 64: centro de la ventana
 TOLERANCIA_LABEL   = 0                  # ±0 en entrenamiento (detección exacta)
 RATIO_UNDERSAMPLING = 10                # negativos guardados por cada positivo
+HARD_NEG_RADIUS = 5                     # vecindad temporal "difícil" (muestras)
+HARD_NEG_WEIGHT = 3.0                   # penalización extra en pérdida
 
 
 # ---------------------------------------------------------------------------
@@ -57,6 +64,8 @@ def _extraer_ventanas_y_etiquetas(
     diana: int = DIANA,
     tolerancia: int = TOLERANCIA_LABEL,
     ratio_undersampling: int = RATIO_UNDERSAMPLING,
+    hard_neg_radius: int = HARD_NEG_RADIUS,
+    hard_neg_weight: float = HARD_NEG_WEIGHT,
     rng=None,
 ) -> tuple:
     """
@@ -73,6 +82,7 @@ def _extraer_ventanas_y_etiquetas(
     -------
     X : (n_sel, long_ventana, 2)  float32  [canales I, Q]
     Y : (n_sel,)                  int64
+    W : (n_sel,)                  float32  (peso de pérdida por muestra)
     """
     if rng is None:
         rng = np.random.default_rng(0)
@@ -83,6 +93,7 @@ def _extraer_ventanas_y_etiquetas(
         return (
             np.empty((0, long_ventana, 2), dtype=np.float32),
             np.empty(0, dtype=np.int64),
+            np.empty(0, dtype=np.float32),
         )
 
     # Centros de cada ventana: centro[i] = i + diana
@@ -90,17 +101,34 @@ def _extraer_ventanas_y_etiquetas(
 
     # Máscara de positivos vectorizada: O(n_paquetes) bucles, O(n_ventanas) ops cada uno
     y_true = np.zeros(n_ventanas, dtype=bool)
+    hard_neg_mask = np.zeros(n_ventanas, dtype=bool)
     for t in instantes_llegada:
-        y_true |= np.abs(centros - int(t)) <= tolerancia
+        dist = np.abs(centros - int(t))
+        y_true |= dist <= tolerancia
+        if hard_neg_radius > 0:
+            hard_neg_mask |= (dist <= hard_neg_radius)
+
+    # hard negatives: cercanos pero estrictamente negativos
+    hard_neg_mask &= ~y_true
 
     # Índices de positivos y negativos
     idx_pos = np.where(y_true)[0]
     idx_neg = np.where(~y_true)[0]
+    idx_neg_hard = np.where(hard_neg_mask)[0]
+    idx_neg_rest = np.setdiff1d(idx_neg, idx_neg_hard, assume_unique=False)
 
     # Undersampling: máximo ratio × n_positivos negativos
     n_neg_max = max(1, len(idx_pos)) * ratio_undersampling
     if len(idx_neg) > n_neg_max:
-        idx_neg = rng.choice(idx_neg, size=n_neg_max, replace=False)
+        if len(idx_neg_hard) >= n_neg_max:
+            idx_neg = rng.choice(idx_neg_hard, size=n_neg_max, replace=False)
+        else:
+            n_faltan = n_neg_max - len(idx_neg_hard)
+            if len(idx_neg_rest) > n_faltan:
+                idx_neg_rest = rng.choice(idx_neg_rest, size=n_faltan, replace=False)
+            idx_neg = np.concatenate([idx_neg_hard, idx_neg_rest])
+    else:
+        idx_neg = np.concatenate([idx_neg_hard, idx_neg_rest])
 
     # Extracción vectorizada con sliding_window_view (sin copia de datos)
     # todas_ventanas: (n_ventanas, long_ventana) complejo
@@ -122,7 +150,14 @@ def _extraer_ventanas_y_etiquetas(
         np.zeros(len(idx_neg), dtype=np.int64),
     ])
 
-    return X, Y
+    w_pos = np.ones(len(idx_pos), dtype=np.float32)
+    if len(idx_neg) > 0:
+        w_neg = np.where(np.isin(idx_neg, idx_neg_hard), float(hard_neg_weight), 1.0).astype(np.float32)
+    else:
+        w_neg = np.empty(0, dtype=np.float32)
+    W = np.concatenate([w_pos, w_neg]).astype(np.float32)
+
+    return X, Y, W
 
 
 # ---------------------------------------------------------------------------
@@ -140,6 +175,8 @@ def generar_dataset_desde_escenarios(
     long_ventana: int = LONG_VENTANA,
     diana: int = DIANA,
     tolerancia_label: int = TOLERANCIA_LABEL,
+    hard_neg_radius: int = HARD_NEG_RADIUS,
+    hard_neg_weight: float = HARD_NEG_WEIGHT,
 ) -> tuple:
     """
     Genera dataset sampleando escenarios ALOHA reales para cubrir todo el
@@ -152,7 +189,7 @@ def generar_dataset_desde_escenarios(
 
     Retorna
     -------
-    X_train, Y_train, X_val, Y_val  (arrays NumPy)
+    X_train, Y_train, W_train, X_val, Y_val, W_val  (arrays NumPy)
     X tiene forma (N, long_ventana, 2) float32; Y tiene forma (N,) int64.
     """
     rng = np.random.default_rng(semilla_base)
@@ -165,8 +202,8 @@ def generar_dataset_desde_escenarios(
     print(f"  Paquete: {NUM_BITS_PRE} (ZC) + {NUM_BITS_DATOS} (BPSK) = {NUM_BITS_PRE + NUM_BITS_DATOS} muestras")
     print(f"  Ventana CNN: {long_ventana}  |  Diana: {diana}  |  Undersampling ratio: {ratio_undersampling}")
 
-    X_train_list, Y_train_list = [], []
-    X_val_list,   Y_val_list   = [], []
+    X_train_list, Y_train_list, W_train_list = [], [], []
+    X_val_list,   Y_val_list,   W_val_list   = [], [], []
 
     for g in lista_G:
         for snr in lista_SNR_dB:
@@ -184,13 +221,15 @@ def generar_dataset_desde_escenarios(
                     usar_preambulo=False,
                 )
 
-                X_k, Y_k = _extraer_ventanas_y_etiquetas(
+                X_k, Y_k, W_k = _extraer_ventanas_y_etiquetas(
                     senal_rx=esc["senal_rx"],
                     instantes_llegada=esc["instantes_llegada_muestras"],
                     long_ventana=long_ventana,
                     diana=diana,
                     tolerancia=tolerancia_label,
                     ratio_undersampling=ratio_undersampling,
+                    hard_neg_radius=hard_neg_radius,
+                    hard_neg_weight=hard_neg_weight,
                     rng=rng,
                 )
 
@@ -201,27 +240,32 @@ def generar_dataset_desde_escenarios(
                 if k < n_escenarios_train:
                     X_train_list.append(X_k)
                     Y_train_list.append(Y_k)
+                    W_train_list.append(W_k)
                 else:
                     X_val_list.append(X_k)
                     Y_val_list.append(Y_k)
+                    W_val_list.append(W_k)
 
     # Concatenar todos los escenarios
     X_train = np.concatenate(X_train_list, axis=0)
     Y_train = np.concatenate(Y_train_list, axis=0)
+    W_train = np.concatenate(W_train_list, axis=0)
     X_val   = np.concatenate(X_val_list,   axis=0)
     Y_val   = np.concatenate(Y_val_list,   axis=0)
+    W_val   = np.concatenate(W_val_list,   axis=0)
 
     # Mezcla aleatoria dentro de cada conjunto (sin cruzar conjuntos)
     idx_tr = rng.permutation(len(X_train))
     idx_vl = rng.permutation(len(X_val))
-    X_train, Y_train = X_train[idx_tr], Y_train[idx_tr]
-    X_val,   Y_val   = X_val[idx_vl],   Y_val[idx_vl]
+    X_train, Y_train, W_train = X_train[idx_tr], Y_train[idx_tr], W_train[idx_tr]
+    X_val,   Y_val,   W_val   = X_val[idx_vl],   Y_val[idx_vl],   W_val[idx_vl]
 
     print(f"\nResultado:")
     print(f"  X_train: {X_train.shape}  |  positivos: {Y_train.sum()} ({100*Y_train.mean():.1f}%)")
     print(f"  X_val  : {X_val.shape}    |  positivos: {Y_val.sum()} ({100*Y_val.mean():.1f}%)")
+    print(f"  Peso medio (train/val): {W_train.mean():.3f} / {W_val.mean():.3f}")
 
-    return X_train, Y_train, X_val, Y_val
+    return X_train, Y_train, W_train, X_val, Y_val, W_val
 
 
 def guardar_dataset(
@@ -239,7 +283,7 @@ def guardar_dataset(
     """
     os.makedirs(directorio_salida, exist_ok=True)
 
-    X_train, Y_train, X_val, Y_val = generar_dataset_desde_escenarios(
+    X_train, Y_train, W_train, X_val, Y_val, W_val = generar_dataset_desde_escenarios(
         n_escenarios_train=n_escenarios_train,
         n_escenarios_val=n_escenarios_val,
         lista_G=lista_G,
@@ -251,15 +295,19 @@ def guardar_dataset(
 
     np.save(os.path.join(directorio_salida, "X_train.npy"), X_train)
     np.save(os.path.join(directorio_salida, "Y_train.npy"), Y_train)
+    np.save(os.path.join(directorio_salida, "W_train.npy"), W_train)
     np.save(os.path.join(directorio_salida, "X_val.npy"),   X_val)
     np.save(os.path.join(directorio_salida, "Y_val.npy"),   Y_val)
+    np.save(os.path.join(directorio_salida, "W_val.npy"),   W_val)
 
     tam_mb = (X_train.nbytes + X_val.nbytes) / 1e6
     print(f"\nDataset guardado en: {directorio_salida}")
     print(f"  X_train.npy : {X_train.shape}  {X_train.dtype}")
     print(f"  Y_train.npy : {Y_train.shape}  {Y_train.dtype}")
+    print(f"  W_train.npy : {W_train.shape}  {W_train.dtype}")
     print(f"  X_val.npy   : {X_val.shape}    {X_val.dtype}")
     print(f"  Y_val.npy   : {Y_val.shape}    {Y_val.dtype}")
+    print(f"  W_val.npy   : {W_val.shape}    {W_val.dtype}")
     print(f"  Tamaño en disco: ~{tam_mb:.0f} MB")
 
 

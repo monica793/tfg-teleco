@@ -8,7 +8,10 @@ Uso en Google Colab (GPU):
   python -m ml.entrenar_modelo --datos /content/dataset_aloha --epochs 50
 
 El script espera que los archivos X_train.npy, Y_train.npy, X_val.npy y
-Y_val.npy ya existan en el directorio `--datos`. Si no existen, se puede
+Y_val.npy ya existan en el directorio `--datos`. Opcionalmente puede cargar
+W_train.npy / W_val.npy para ponderar la pérdida (hard negatives cercanos).
+Si no existen, se usan pesos unitarios.
+Si no existen los datos, se puede
 generar el dataset primero con:
   python -m ml.generar_dataset --salida data/dataset_aloha
 
@@ -59,6 +62,17 @@ class ALOHADataModule(L.LightningDataModule):
         X_val = np.load(os.path.join(self.directorio_datos, "X_val.npy"))
         Y_val = np.load(os.path.join(self.directorio_datos, "Y_val.npy"))
 
+        ruta_w_train = os.path.join(self.directorio_datos, "W_train.npy")
+        ruta_w_val = os.path.join(self.directorio_datos, "W_val.npy")
+        if os.path.exists(ruta_w_train) and os.path.exists(ruta_w_val):
+            W_train = np.load(ruta_w_train).astype(np.float32)
+            W_val = np.load(ruta_w_val).astype(np.float32)
+            print("[DataModule] Pesos de pérdida detectados: W_train.npy / W_val.npy")
+        else:
+            W_train = np.ones_like(Y_train, dtype=np.float32)
+            W_val = np.ones_like(Y_val, dtype=np.float32)
+            print("[DataModule] Sin pesos W_*.npy: se usan pesos unitarios")
+
         # (N, 128, 2) → (N, 2, 128) para Conv1d
         X_train = np.transpose(X_train, (0, 2, 1))
         X_val = np.transpose(X_val, (0, 2, 1))
@@ -66,10 +80,12 @@ class ALOHADataModule(L.LightningDataModule):
         self.ds_train = TensorDataset(
             torch.from_numpy(X_train),
             torch.from_numpy(Y_train).float(),
+            torch.from_numpy(W_train).float(),
         )
         self.ds_val = TensorDataset(
             torch.from_numpy(X_val),
             torch.from_numpy(Y_val).float(),
+            torch.from_numpy(W_val).float(),
         )
 
     def train_dataloader(self):
@@ -99,7 +115,7 @@ class DetectorALOHA(L.LightningModule):
     """
     Módulo de entrenamiento para el detector CNN 1D de inicio de paquete.
 
-    Pérdida: BCEWithLogitsLoss (incluye sigmoid internamente, numéricamente estable).
+    Pérdida: BCEWithLogitsLoss con reducción none + promedio ponderado por muestra.
     Optimizador: Adam con lr inicial 1e-3.
     Scheduler: ReduceLROnPlateau sobre val_loss (factor 0.5, paciencia 5 épocas).
     """
@@ -108,15 +124,16 @@ class DetectorALOHA(L.LightningModule):
         super().__init__()
         self.save_hyperparameters()
         self.modelo = ModeloCNN(dropout=dropout)
-        self.criterio = nn.BCEWithLogitsLoss()
+        self.criterio = nn.BCEWithLogitsLoss(reduction="none")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.modelo(x)
 
     def _paso_comun(self, batch, etapa: str):
-        x, y = batch
+        x, y, w = batch
         logit = self(x).squeeze(1)       # (N,)
-        loss = self.criterio(logit, y)
+        loss_vec = self.criterio(logit, y)
+        loss = (loss_vec * w).sum() / torch.clamp(w.sum(), min=1e-8)
 
         with torch.no_grad():
             pred = (torch.sigmoid(logit) >= 0.5).float()
