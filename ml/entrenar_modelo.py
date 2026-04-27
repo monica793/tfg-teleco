@@ -35,6 +35,12 @@ from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
 from lightning.pytorch.loggers import WandbLogger
 
 from ml.modelo import ModeloCNN
+from ml.modelo_energia import ModeloCNNEnergia
+
+MODELOS_DISPONIBLES = {
+    "iq":      ModeloCNN,
+    "energia": ModeloCNNEnergia,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -120,10 +126,11 @@ class DetectorALOHA(L.LightningModule):
     Scheduler: ReduceLROnPlateau sobre val_loss (factor 0.5, paciencia 5 épocas).
     """
 
-    def __init__(self, lr: float = 1e-3, dropout: float = 0.3):
+    def __init__(self, lr: float = 1e-3, dropout: float = 0.3, tipo_modelo: str = "iq"):
         super().__init__()
         self.save_hyperparameters()
-        self.modelo = ModeloCNN(dropout=dropout)
+        clase_modelo = MODELOS_DISPONIBLES.get(tipo_modelo, ModeloCNN)
+        self.modelo = clase_modelo(dropout=dropout)
         self.criterio = nn.BCEWithLogitsLoss(reduction="none")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -175,6 +182,7 @@ def entrenar(
     usar_wandb: bool = True,
     proyecto_wandb: str = "tfg-aloha-detector",
     num_workers: int = 0,
+    tipo_modelo: str = "iq",
 ):
     """
     Lanza el entrenamiento completo con PyTorch Lightning.
@@ -197,7 +205,7 @@ def entrenar(
         num_workers=num_workers,
     )
 
-    modelo_lightning = DetectorALOHA(lr=lr, dropout=dropout)
+    modelo_lightning = DetectorALOHA(lr=lr, dropout=dropout, tipo_modelo=tipo_modelo)
 
     callbacks = [
         ModelCheckpoint(
@@ -254,6 +262,9 @@ if __name__ == "__main__":
     parser.add_argument("--sin_wandb", action="store_true",
                         help="Desactiva WandB (útil para pruebas locales rápidas)")
     parser.add_argument("--workers", type=int, default=0)
+    parser.add_argument("--modelo", type=str, default="iq",
+                        choices=list(MODELOS_DISPONIBLES.keys()),
+                        help="Arquitectura: 'iq' (ModeloCNN original) o 'energia' (ModeloCNNEnergia)")
     args = parser.parse_args()
 
     entrenar(
@@ -265,4 +276,5 @@ if __name__ == "__main__":
         dropout=args.dropout,
         usar_wandb=not args.sin_wandb,
         num_workers=args.workers,
+        tipo_modelo=args.modelo,
     )

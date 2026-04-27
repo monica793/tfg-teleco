@@ -82,36 +82,41 @@ class ModeloCNN(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Utilidad: cargar modelo desde checkpoint de Lightning
+# Utilidades: cargar modelo desde checkpoint de Lightning
 # ---------------------------------------------------------------------------
 
-def cargar_modelo_desde_checkpoint(ruta_checkpoint: str, map_location: str = "cpu") -> ModeloCNN:
-    """
-    Carga los pesos del ModeloCNN desde un checkpoint de PyTorch Lightning.
-
-    El checkpoint de Lightning guarda el estado del LightningModule; los pesos
-    del modelo interno están bajo la clave 'state_dict' con prefijo 'modelo.'.
-
-    Parámetros
-    ----------
-    ruta_checkpoint : ruta al archivo .ckpt
-    map_location    : dispositivo de destino ('cpu', 'cuda', etc.)
-
-    Retorna
-    -------
-    ModeloCNN con pesos cargados en modo evaluación.
-    """
+def _extraer_state_dict(ruta_checkpoint: str, map_location: str) -> dict:
+    """Extrae el state_dict del modelo interno desde un checkpoint de Lightning."""
     ckpt = torch.load(ruta_checkpoint, map_location=map_location)
-    state_dict_lightning = ckpt["state_dict"]
-
-    # Eliminar el prefijo 'modelo.' añadido por LightningModule
-    state_dict_modelo = {
+    return {
         k.removeprefix("modelo."): v
-        for k, v in state_dict_lightning.items()
+        for k, v in ckpt["state_dict"].items()
         if k.startswith("modelo.")
     }
 
+
+def cargar_modelo_desde_checkpoint(ruta_checkpoint: str, map_location: str = "cpu") -> ModeloCNN:
+    """Carga ModeloCNN (IQ) desde un checkpoint de PyTorch Lightning."""
     modelo = ModeloCNN()
-    modelo.load_state_dict(state_dict_modelo)
+    modelo.load_state_dict(_extraer_state_dict(ruta_checkpoint, map_location))
+    modelo.eval()
+    return modelo
+
+
+def cargar_checkpoint_automatico(ruta_checkpoint: str, map_location: str = "cpu") -> nn.Module:
+    """
+    Carga automáticamente ModeloCNN o ModeloCNNEnergia según los pesos del checkpoint.
+
+    Detecta el tipo por la presencia de 'cabeza_densa' (IQ) o 'cabeza' (energia)
+    en las claves del state_dict.
+
+    Útil para no tener que especificar el tipo al evaluar.
+    """
+    from ml.modelo_energia import ModeloCNNEnergia
+    state_dict = _extraer_state_dict(ruta_checkpoint, map_location)
+    tiene_conv = any(k.startswith("bloques_conv") for k in state_dict)
+    clase = ModeloCNN if tiene_conv else ModeloCNNEnergia
+    modelo = clase()
+    modelo.load_state_dict(state_dict)
     modelo.eval()
     return modelo
