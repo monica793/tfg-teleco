@@ -177,6 +177,7 @@ def generar_dataset_desde_escenarios(
     tolerancia_label: int = TOLERANCIA_LABEL,
     hard_neg_radius: int = HARD_NEG_RADIUS,
     hard_neg_weight: float = HARD_NEG_WEIGHT,
+    usar_preambulo: bool = False,
 ) -> tuple:
     """
     Genera dataset sampleando escenarios ALOHA reales para cubrir todo el
@@ -218,7 +219,7 @@ def generar_dataset_desde_escenarios(
                     num_bits_pre=NUM_BITS_PRE,
                     num_bits_datos=NUM_BITS_DATOS,
                     semilla=semilla_k,
-                    usar_preambulo=False,
+                    usar_preambulo=usar_preambulo,
                 )
 
                 X_k, Y_k, W_k = _extraer_ventanas_y_etiquetas(
@@ -279,6 +280,7 @@ def guardar_dataset(
     semilla_base: int = SEMILLA_BASE,
     hard_neg_radius: int = HARD_NEG_RADIUS,
     hard_neg_weight: float = HARD_NEG_WEIGHT,
+    usar_preambulo: bool = False,
 ) -> None:
     """
     Genera y guarda el dataset en formato .npy en el directorio especificado.
@@ -295,6 +297,7 @@ def guardar_dataset(
         semilla_base=semilla_base,
         hard_neg_radius=hard_neg_radius,
         hard_neg_weight=hard_neg_weight,
+        usar_preambulo=usar_preambulo,
     )
 
     np.save(os.path.join(directorio_salida, "X_train.npy"), X_train)
@@ -323,6 +326,8 @@ if __name__ == "__main__":
         description="Genera dataset de detección CNN desde escenarios ALOHA reales."
     )
     parser.add_argument("--salida",            type=str,   default="data/dataset_aloha")
+    parser.add_argument("--usar_preambulo",    action="store_true", default=False,
+                        help="Incluye preámbulo ZC en los paquetes del dataset (para test con preámbulo).")
     parser.add_argument("--n_train",           type=int,   default=200)
     parser.add_argument("--n_val",             type=int,   default=50)
     parser.add_argument("--ventana_ft",        type=int,   default=50,
@@ -345,4 +350,5 @@ if __name__ == "__main__":
         semilla_base=args.semilla,
         hard_neg_radius=args.hard_neg_radius,
         hard_neg_weight=args.hard_neg_weight,
+        usar_preambulo=args.usar_preambulo,
     )
