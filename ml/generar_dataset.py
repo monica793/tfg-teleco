@@ -43,14 +43,14 @@ from pipeline.protocolo_evaluacion import (
 )
 
 # ---------------------------------------------------------------------------
-# Constantes del dataset (congeladas)
+# Constantes del dataset
 # ---------------------------------------------------------------------------
-LONG_VENTANA       = LONG_VENTANA_CNN   # 128 muestras = 2^7
-DIANA              = LONG_VENTANA // 2  # muestra 64: centro de la ventana
-TOLERANCIA_LABEL   = 0                  # ±0 en entrenamiento (detección exacta)
-RATIO_UNDERSAMPLING = 10                # negativos guardados por cada positivo
-HARD_NEG_RADIUS = 5                     # vecindad temporal "difícil" (muestras)
-HARD_NEG_WEIGHT = 1.5                   # penalización extra en pérdida
+LONG_VENTANA        = LONG_VENTANA_CNN  # 128 muestras = 2^7
+DIANA               = LONG_VENTANA // 2 # muestra 64: centro de la ventana
+TOLERANCIA_LABEL    = 0                 # ±0 en entrenamiento (detección exacta)
+RATIO_UNDERSAMPLING = 10                # negativos por positivo (1 = 50/50)
+HARD_NEG_RADIUS     = 5                 # vecindad "difícil" en muestras
+HARD_NEG_WEIGHT     = 1.5              # penalización extra en pérdida para hard negatives
 
 
 # ---------------------------------------------------------------------------
@@ -66,6 +66,7 @@ def _extraer_ventanas_y_etiquetas(
     ratio_undersampling: int = RATIO_UNDERSAMPLING,
     hard_neg_radius: int = HARD_NEG_RADIUS,
     hard_neg_weight: float = HARD_NEG_WEIGHT,
+    incluir_canal_energia: bool = False,
     rng=None,
 ) -> tuple:
     """
@@ -76,13 +77,21 @@ def _extraer_ventanas_y_etiquetas(
       - Y[i] = 1 si |centro - t_real| <= tolerancia para algún t_real
       - Y[i] = 0 en otro caso
 
-    Después aplica undersampling de negativos.
+    Undersampling con prioridad de hard negatives:
+      Se guardan como máximo ratio_undersampling × n_pos negativos.
+      Los hard negatives (cercanos al onset) tienen preferencia.
+      Con ratio_undersampling=1 se obtiene un dataset 50/50.
+
+    Parámetros
+    ----------
+    incluir_canal_energia : si True, añade un 3er canal con la energía
+        normalizada por ventana (I²+Q² / media). Necesario para ModeloCNNv3.
 
     Retorna
     -------
-    X : (n_sel, long_ventana, 2)  float32  [canales I, Q]
-    Y : (n_sel,)                  int64
-    W : (n_sel,)                  float32  (peso de pérdida por muestra)
+    X : (n_sel, long_ventana, 2 o 3)  float32
+    Y : (n_sel,)                       int64
+    W : (n_sel,)                       float32  (peso de pérdida por muestra)
     """
     if rng is None:
         rng = np.random.default_rng(0)
@@ -138,12 +147,19 @@ def _extraer_ventanas_y_etiquetas(
     idx_sel = np.concatenate([idx_pos, idx_neg])
     ventanas_sel = todas_ventanas[idx_sel]                 # (n_sel, L) complejo
 
-    # (n_sel, L, 2): canal 0 = I, canal 1 = Q
-    X = np.stack(
-        [ventanas_sel.real.astype(np.float32),
-         ventanas_sel.imag.astype(np.float32)],
-        axis=-1,
-    )
+    canal_I = ventanas_sel.real.astype(np.float32)         # (n_sel, L)
+    canal_Q = ventanas_sel.imag.astype(np.float32)         # (n_sel, L)
+
+    if incluir_canal_energia:
+        # Energía por muestra normalizada por la media de la ventana.
+        # El patrón de salto de energía en el centro codifica cuándo empieza
+        # la señal, complementando la información de fase de I/Q.
+        energia = canal_I ** 2 + canal_Q ** 2              # (n_sel, L)
+        mu_e = energia.mean(axis=1, keepdims=True) + 1e-8
+        canal_E = (energia / mu_e).astype(np.float32)      # (n_sel, L)
+        X = np.stack([canal_I, canal_Q, canal_E], axis=-1) # (n_sel, L, 3)
+    else:
+        X = np.stack([canal_I, canal_Q], axis=-1)          # (n_sel, L, 2)
 
     Y = np.concatenate([
         np.ones(len(idx_pos), dtype=np.int64),
@@ -152,7 +168,9 @@ def _extraer_ventanas_y_etiquetas(
 
     w_pos = np.ones(len(idx_pos), dtype=np.float32)
     if len(idx_neg) > 0:
-        w_neg = np.where(np.isin(idx_neg, idx_neg_hard), float(hard_neg_weight), 1.0).astype(np.float32)
+        w_neg = np.where(
+            np.isin(idx_neg, idx_neg_hard), float(hard_neg_weight), 1.0
+        ).astype(np.float32)
     else:
         w_neg = np.empty(0, dtype=np.float32)
     W = np.concatenate([w_pos, w_neg]).astype(np.float32)
@@ -178,6 +196,7 @@ def generar_dataset_desde_escenarios(
     hard_neg_radius: int = HARD_NEG_RADIUS,
     hard_neg_weight: float = HARD_NEG_WEIGHT,
     usar_preambulo: bool = False,
+    incluir_canal_energia: bool = False,
 ) -> tuple:
     """
     Genera dataset sampleando escenarios ALOHA reales para cubrir todo el
@@ -191,17 +210,21 @@ def generar_dataset_desde_escenarios(
     Retorna
     -------
     X_train, Y_train, W_train, X_val, Y_val, W_val  (arrays NumPy)
-    X tiene forma (N, long_ventana, 2) float32; Y tiene forma (N,) int64.
+    X tiene forma (N, long_ventana, 2) o (N, long_ventana, 3) si incluir_canal_energia=True.
     """
     rng = np.random.default_rng(semilla_base)
     n_total = n_escenarios_train + n_escenarios_val
     n_cond  = len(lista_G) * len(lista_SNR_dB)
 
+    n_canales = 3 if incluir_canal_energia else 2
     print(f"Generando dataset desde escenarios ALOHA reales:")
     print(f"  Condiciones (G × SNR) : {n_cond}")
     print(f"  Escenarios por condición: {n_total} ({n_escenarios_train} train + {n_escenarios_val} val)")
     print(f"  Paquete: {NUM_BITS_PRE} (ZC) + {NUM_BITS_DATOS} (BPSK) = {NUM_BITS_PRE + NUM_BITS_DATOS} muestras")
     print(f"  Ventana CNN: {long_ventana}  |  Diana: {diana}  |  Undersampling ratio: {ratio_undersampling}")
+    print(f"  Canales X: {n_canales} {'(I, Q, Energía)' if n_canales == 3 else '(I, Q)'}")
+    balance = "50/50" if ratio_undersampling == 1 else f"1:{ratio_undersampling}"
+    print(f"  Balance positivo/negativo: {balance}")
 
     X_train_list, Y_train_list, W_train_list = [], [], []
     X_val_list,   Y_val_list,   W_val_list   = [], [], []
@@ -231,6 +254,7 @@ def generar_dataset_desde_escenarios(
                     ratio_undersampling=ratio_undersampling,
                     hard_neg_radius=hard_neg_radius,
                     hard_neg_weight=hard_neg_weight,
+                    incluir_canal_energia=incluir_canal_energia,
                     rng=rng,
                 )
 
@@ -281,6 +305,7 @@ def guardar_dataset(
     hard_neg_radius: int = HARD_NEG_RADIUS,
     hard_neg_weight: float = HARD_NEG_WEIGHT,
     usar_preambulo: bool = False,
+    incluir_canal_energia: bool = False,
 ) -> None:
     """
     Genera y guarda el dataset en formato .npy en el directorio especificado.
@@ -298,6 +323,7 @@ def guardar_dataset(
         hard_neg_radius=hard_neg_radius,
         hard_neg_weight=hard_neg_weight,
         usar_preambulo=usar_preambulo,
+        incluir_canal_energia=incluir_canal_energia,
     )
 
     np.save(os.path.join(directorio_salida, "X_train.npy"), X_train)
@@ -325,20 +351,23 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Genera dataset de detección CNN desde escenarios ALOHA reales."
     )
-    parser.add_argument("--salida",            type=str,   default="data/dataset_aloha")
+    parser.add_argument("--salida",            type=str,   default="data/dataset_aloha",
+                        help="Directorio de salida para los .npy del dataset.")
     parser.add_argument("--usar_preambulo",    action="store_true", default=False,
-                        help="Incluye preámbulo ZC en los paquetes del dataset (para test con preámbulo).")
+                        help="Incluye preámbulo ZC en los paquetes (detector con preámbulo).")
+    parser.add_argument("--incluir_energia",   action="store_true", default=False,
+                        help="Añade canal de energía normalizada (3er canal). Necesario para ModeloCNNv3.")
     parser.add_argument("--n_train",           type=int,   default=200)
     parser.add_argument("--n_val",             type=int,   default=50)
     parser.add_argument("--ventana_ft",        type=int,   default=50,
-                        help="Duración de cada escenario en frame times")
-    parser.add_argument("--ratio_undersample", type=int,   default=RATIO_UNDERSAMPLING)
+                        help="Duración de cada escenario en frame times.")
+    parser.add_argument("--ratio_undersample", type=int,   default=RATIO_UNDERSAMPLING,
+                        help="Negativos por positivo (1 = dataset 50/50, 10 = default desbalanceado).")
     parser.add_argument("--semilla",           type=int,   default=SEMILLA_BASE)
     parser.add_argument("--hard_neg_radius",   type=int,   default=HARD_NEG_RADIUS,
-                        help="Radio de hard negatives en muestras. "
-                             "Recomendado: 5 para modelo IQ, 8 para modelo energia.")
+                        help="Radio de hard negatives en muestras (recomendado: 8 para v3).")
     parser.add_argument("--hard_neg_weight",   type=float, default=HARD_NEG_WEIGHT,
-                        help="Peso extra de hard negatives en la pérdida. Default: 1.5")
+                        help="Peso extra de hard negatives en la pérdida.")
     args = parser.parse_args()
 
     guardar_dataset(
@@ -351,4 +380,5 @@ if __name__ == "__main__":
         hard_neg_radius=args.hard_neg_radius,
         hard_neg_weight=args.hard_neg_weight,
         usar_preambulo=args.usar_preambulo,
+        incluir_canal_energia=args.incluir_energia,
     )

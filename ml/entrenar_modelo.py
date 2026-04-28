@@ -34,12 +34,14 @@ import lightning as L
 from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
 from lightning.pytorch.loggers import WandbLogger
 
-from ml.modelo import ModeloCNN
+from ml.modelo import ModeloCNN, ModeloCNNLegacy, ModeloCNNv3
 from ml.modelo_energia import ModeloCNNEnergia
 
 MODELOS_DISPONIBLES = {
-    "iq":      ModeloCNN,
-    "energia": ModeloCNNEnergia,
+    "iq":        ModeloCNN,
+    "iq_legacy": ModeloCNNLegacy,
+    "energia":   ModeloCNNEnergia,
+    "v3":        ModeloCNNv3,
 }
 
 
@@ -188,6 +190,7 @@ def entrenar(
     num_workers: int = 0,
     tipo_modelo: str = "iq",
     pos_weight: float = 1.0,
+    nombre_ckpt: str = "mejor",
 ):
     """
     Lanza el entrenamiento completo con PyTorch Lightning.
@@ -203,6 +206,8 @@ def entrenar(
     usar_wandb        : si True, activa el logger de Weights & Biases.
     proyecto_wandb    : nombre del proyecto en WandB.
     num_workers       : workers para DataLoader (0 = sin multiprocessing).
+    nombre_ckpt       : prefijo del nombre del checkpoint guardado.
+                        Ejemplo: 'v3_5050_HN8' → 'v3_5050_HN8-epoch=XX-val_loss=X.XXXX.ckpt'.
     """
     datamodule = ALOHADataModule(
         directorio_datos=directorio_datos,
@@ -215,7 +220,7 @@ def entrenar(
     callbacks = [
         ModelCheckpoint(
             dirpath=directorio_ckpt,
-            filename="mejor-{epoch:02d}-{val_loss:.4f}",
+            filename=f"{nombre_ckpt}-{{epoch:02d}}-{{val_loss:.4f}}",
             monitor="val_loss",
             mode="min",
             save_top_k=1,
@@ -269,11 +274,19 @@ if __name__ == "__main__":
     parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--modelo", type=str, default="iq",
                         choices=list(MODELOS_DISPONIBLES.keys()),
-                        help="Arquitectura: 'iq' (ModeloCNN original) o 'energia' (ModeloCNNEnergia)")
+                        help="Arquitectura: 'iq', 'iq_legacy', 'energia' o 'v3' (IQ+Energía, sin pool).")
     parser.add_argument("--pos_weight", type=float, default=1.0,
                         help="Peso de los positivos en la pérdida (>1 fuerza más detecciones). "
-                             "Recomendado: 10.0 para energia, 1.0 para iq con hard negatives.")
+                             "Con dataset 50/50 (v3) usar 1.0.")
+    parser.add_argument("--nombre_ckpt", type=str, default=None,
+                        help="Prefijo del checkpoint guardado. Si no se indica, se usa el nombre "
+                             "del modelo (p.ej. 'v3_5050_HN8'). "
+                             "Resultado: <prefijo>-epoch=XX-val_loss=X.XXXX.ckpt")
     args = parser.parse_args()
+
+    # Nombre de checkpoint: si el usuario no lo especifica, se genera automáticamente
+    # con el tipo de modelo para facilitar la identificación posterior.
+    nombre_ckpt = args.nombre_ckpt if args.nombre_ckpt else args.modelo
 
     entrenar(
         directorio_datos=args.datos,
@@ -286,4 +299,5 @@ if __name__ == "__main__":
         num_workers=args.workers,
         tipo_modelo=args.modelo,
         pos_weight=args.pos_weight,
+        nombre_ckpt=nombre_ckpt,
     )
