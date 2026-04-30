@@ -1,31 +1,29 @@
 """
-Generación del dataset de entrenamiento por sampleo de escenarios Pure ALOHA reales.
+Generación del dataset para la campaña experimental Fase 1 y siguientes.
 
-Filosofía (sustituye la generación por clases aisladas):
-  En lugar de fabricar ventanas sintéticas con clases diseñadas a mano,
-  se generan escenarios ALOHA completos con `generar_escenario_phy` (que ya
-  incluye colisiones, ruido AWGN y tráfico Poisson real) y se extrae el
-  dataset deslizando una ventana de 128 muestras sobre la señal larga.
+Parámetros clave
+----------------
+representacion : "energia" | "iq" | "iq_energia"
+    Determina los canales de entrada que verá la red.
+    - "energia"    → 1 canal:  E = (I²+Q²) normalizado por media de ventana
+    - "iq"         → 2 canales: I, Q
+    - "iq_energia" → 3 canales: I, Q, E
 
-Etiquetado (Diana Central):
-  Una ventana que empieza en el índice i tiene su centro en (i + 64).
-  Esa ventana recibe etiqueta Y=1 si y solo si su centro coincide exactamente
-  (tolerancia ±0 en entrenamiento) con un instante real de llegada de paquete.
-  Cualquier otro caso → Y=0.
+modo_label : "onset_centro" | "ventana_llena"
+    Define qué ventanas reciben etiqueta positiva.
+    - "onset_centro" : y=1 si el inicio real cae en el centro (pos. 64)
+    - "ventana_llena": y=1 si el inicio real cae al inicio de la ventana
+                       (paquete ocupa toda la ventana exactamente)
+    El segundo modo se añade para Fase 2 y siguientes.
 
-Prevención de data leakage:
-  El split train/val se realiza dividiendo ESCENARIOS COMPLETOS, nunca
-  partiendo ventanas del mismo escenario en ambos conjuntos.
-
-Balanceo de clases:
-  El tráfico ALOHA genera un desbalance brutal (~1 positivo cada L muestras).
-  Se aplica undersampling de la clase negativa: por cada positivo se guardan
-  como máximo RATIO_UNDERSAMPLING negativos.
-
-Hard negatives:
-  Las ventanas negativas cercanas al inicio real (|delta| <= HARD_NEG_RADIUS,
-  excluyendo delta=0) se conservan de forma preferente y reciben un peso de
-  pérdida mayor para forzar precisión temporal fina.
+Protocolo de generación (idéntico entre representaciones para comparabilidad)
+---------------------------------------------------------------------------
+- Escenarios Pure ALOHA reales (senal_rx completa).
+- Ventana deslizante stride=1, longitud 128.
+- Split por escenario completo (sin data leakage).
+- Balance 50/50 positivo/negativo en train y val.
+- Hard negatives (ventanas cercanas al onset) con prioridad en el muestreo
+  y peso de pérdida ligeramente aumentado.
 """
 
 import argparse
@@ -41,57 +39,113 @@ from pipeline.protocolo_evaluacion import (
     SEMILLA_BASE,
     LONG_VENTANA_CNN,
 )
+from ml.modelo_fase1 import IN_CHANNELS, REPRESENTACIONES_VALIDAS
 
 # ---------------------------------------------------------------------------
-# Constantes del dataset
+# Constantes de protocolo (congeladas para Fase 1)
 # ---------------------------------------------------------------------------
-LONG_VENTANA        = LONG_VENTANA_CNN  # 128 muestras = 2^7
-DIANA               = LONG_VENTANA // 2 # muestra 64: centro de la ventana
-TOLERANCIA_LABEL    = 0                 # ±0 en entrenamiento (detección exacta)
-RATIO_UNDERSAMPLING = 10                # negativos por positivo (1 = 50/50)
-HARD_NEG_RADIUS     = 5                 # vecindad "difícil" en muestras
-HARD_NEG_WEIGHT     = 1.5              # penalización extra en pérdida para hard negatives
+LONG_VENTANA        = LONG_VENTANA_CNN  # 128
+DIANA               = LONG_VENTANA // 2  # 64 — centro de ventana
+TOLERANCIA_LABEL    = 0                  # onset estricto
+RATIO_UNDERSAMPLING = 1                  # 50/50
+HARD_NEG_RADIUS     = 4                  # muestras alrededor del onset
+HARD_NEG_WEIGHT     = 1.25              # peso extra en pérdida para hard negatives
+
+LISTA_G_DEFAULT   = (0.2, 0.4, 0.6, 0.8)
+LISTA_SNR_DEFAULT = (0.0, 3.0, 6.0, 10.0)
 
 
 # ---------------------------------------------------------------------------
-# Núcleo: extracción vectorizada de ventanas desde un escenario
+# Construcción de canales según representación
+# ---------------------------------------------------------------------------
+
+def _construir_canales(ventanas_sel: np.ndarray, representacion: str) -> np.ndarray:
+    """
+    Transforma ventanas complejas (n_sel, L) al array de canales (n_sel, L, C).
+
+    representacion : "energia" → C=1, "iq" → C=2, "iq_energia" → C=3
+    """
+    I = ventanas_sel.real.astype(np.float32)   # (n_sel, L)
+    Q = ventanas_sel.imag.astype(np.float32)   # (n_sel, L)
+
+    if representacion == "iq":
+        return np.stack([I, Q], axis=-1)        # (n_sel, L, 2)
+
+    # Energía normalizada: E[n] = I[n]² + Q[n]², dividida por media de ventana
+    E = I ** 2 + Q ** 2                         # (n_sel, L)
+    mu = E.mean(axis=1, keepdims=True) + 1e-8
+    E_norm = (E / mu).astype(np.float32)        # (n_sel, L)
+
+    if representacion == "energia":
+        return E_norm[:, :, None]               # (n_sel, L, 1)
+
+    # "iq_energia"
+    return np.stack([I, Q, E_norm], axis=-1)    # (n_sel, L, 3)
+
+
+# ---------------------------------------------------------------------------
+# Etiquetado según modo_label
+# ---------------------------------------------------------------------------
+
+def _calcular_etiquetas(
+    centros: np.ndarray,
+    indices_inicio: np.ndarray,
+    instantes_llegada: np.ndarray,
+    modo_label: str,
+    tolerancia: int,
+    hard_neg_radius: int,
+) -> tuple:
+    """
+    Calcula y_true (bool) y hard_neg_mask (bool) para las n_ventanas ventanas.
+
+    Retorna (y_true, hard_neg_mask) — ambos (n_ventanas,) bool.
+    """
+    n = len(centros)
+    y_true = np.zeros(n, dtype=bool)
+    hard_neg_mask = np.zeros(n, dtype=bool)
+
+    if modo_label == "onset_centro":
+        ref = centros   # distancia desde centro de ventana al onset
+    elif modo_label == "ventana_llena":
+        ref = indices_inicio  # distancia desde inicio de ventana al onset
+    else:
+        raise ValueError(f"modo_label desconocido: {modo_label!r}")
+
+    for t in instantes_llegada:
+        dist = np.abs(ref - int(t))
+        y_true |= dist <= tolerancia
+        if hard_neg_radius > 0:
+            hard_neg_mask |= dist <= hard_neg_radius
+
+    hard_neg_mask &= ~y_true
+    return y_true, hard_neg_mask
+
+
+# ---------------------------------------------------------------------------
+# Extracción de ventanas + etiquetas + pesos para un escenario
 # ---------------------------------------------------------------------------
 
 def _extraer_ventanas_y_etiquetas(
     senal_rx: np.ndarray,
     instantes_llegada: np.ndarray,
+    representacion: str = "iq",
+    modo_label: str = "onset_centro",
     long_ventana: int = LONG_VENTANA,
     diana: int = DIANA,
     tolerancia: int = TOLERANCIA_LABEL,
     ratio_undersampling: int = RATIO_UNDERSAMPLING,
     hard_neg_radius: int = HARD_NEG_RADIUS,
     hard_neg_weight: float = HARD_NEG_WEIGHT,
-    incluir_canal_energia: bool = False,
     rng=None,
 ) -> tuple:
     """
-    Desliza ventana de `long_ventana` muestras (stride=1) sobre un escenario.
-
-    Para cada ventana i:
-      - centro = i + diana
-      - Y[i] = 1 si |centro - t_real| <= tolerancia para algún t_real
-      - Y[i] = 0 en otro caso
-
-    Undersampling con prioridad de hard negatives:
-      Se guardan como máximo ratio_undersampling × n_pos negativos.
-      Los hard negatives (cercanos al onset) tienen preferencia.
-      Con ratio_undersampling=1 se obtiene un dataset 50/50.
-
-    Parámetros
-    ----------
-    incluir_canal_energia : si True, añade un 3er canal con la energía
-        normalizada por ventana (I²+Q² / media). Necesario para ModeloCNNv3.
+    Desliza ventana stride=1 sobre el escenario y extrae X, Y, W.
 
     Retorna
     -------
-    X : (n_sel, long_ventana, 2 o 3)  float32
-    Y : (n_sel,)                       int64
-    W : (n_sel,)                       float32  (peso de pérdida por muestra)
+    X : (n_sel, L, C)  float32
+    Y : (n_sel,)        int64
+    W : (n_sel,)        float32  peso de pérdida por muestra
     """
     if rng is None:
         rng = np.random.default_rng(0)
@@ -99,142 +153,108 @@ def _extraer_ventanas_y_etiquetas(
     N = len(senal_rx)
     n_ventanas = N - long_ventana + 1
     if n_ventanas <= 0:
+        C = IN_CHANNELS[representacion]
         return (
-            np.empty((0, long_ventana, 2), dtype=np.float32),
+            np.empty((0, long_ventana, C), dtype=np.float32),
             np.empty(0, dtype=np.int64),
             np.empty(0, dtype=np.float32),
         )
 
-    # Centros de cada ventana: centro[i] = i + diana
-    centros = np.arange(n_ventanas, dtype=np.int64) + diana
+    indices_inicio = np.arange(n_ventanas, dtype=np.int64)
+    centros = indices_inicio + diana
 
-    # Máscara de positivos vectorizada: O(n_paquetes) bucles, O(n_ventanas) ops cada uno
-    y_true = np.zeros(n_ventanas, dtype=bool)
-    hard_neg_mask = np.zeros(n_ventanas, dtype=bool)
-    for t in instantes_llegada:
-        dist = np.abs(centros - int(t))
-        y_true |= dist <= tolerancia
-        if hard_neg_radius > 0:
-            hard_neg_mask |= (dist <= hard_neg_radius)
+    y_true, hard_neg_mask = _calcular_etiquetas(
+        centros, indices_inicio, instantes_llegada,
+        modo_label, tolerancia, hard_neg_radius,
+    )
 
-    # hard negatives: cercanos pero estrictamente negativos
-    hard_neg_mask &= ~y_true
-
-    # Índices de positivos y negativos
     idx_pos = np.where(y_true)[0]
-    idx_neg = np.where(~y_true)[0]
     idx_neg_hard = np.where(hard_neg_mask)[0]
-    idx_neg_rest = np.setdiff1d(idx_neg, idx_neg_hard, assume_unique=False)
+    idx_neg_rest = np.where(~y_true & ~hard_neg_mask)[0]
 
-    # Undersampling: máximo ratio × n_positivos negativos
+    # Undersampling 50/50: máximo ratio × n_pos negativos, priorizando hard negatives
     n_neg_max = max(1, len(idx_pos)) * ratio_undersampling
-    if len(idx_neg) > n_neg_max:
-        if len(idx_neg_hard) >= n_neg_max:
-            idx_neg = rng.choice(idx_neg_hard, size=n_neg_max, replace=False)
-        else:
-            n_faltan = n_neg_max - len(idx_neg_hard)
-            if len(idx_neg_rest) > n_faltan:
-                idx_neg_rest = rng.choice(idx_neg_rest, size=n_faltan, replace=False)
-            idx_neg = np.concatenate([idx_neg_hard, idx_neg_rest])
+    if len(idx_neg_hard) >= n_neg_max:
+        idx_neg = rng.choice(idx_neg_hard, size=n_neg_max, replace=False)
     else:
-        idx_neg = np.concatenate([idx_neg_hard, idx_neg_rest])
+        n_faltan = n_neg_max - len(idx_neg_hard)
+        rest_sel = rng.choice(idx_neg_rest, size=min(n_faltan, len(idx_neg_rest)), replace=False)
+        idx_neg = np.concatenate([idx_neg_hard, rest_sel])
 
-    # Extracción vectorizada con sliding_window_view (sin copia de datos)
-    # todas_ventanas: (n_ventanas, long_ventana) complejo
-    todas_ventanas = sliding_window_view(senal_rx, window_shape=long_ventana)
-
-    # Seleccionar solo los índices necesarios y convertir a I/Q float32
     idx_sel = np.concatenate([idx_pos, idx_neg])
-    ventanas_sel = todas_ventanas[idx_sel]                 # (n_sel, L) complejo
+    todas_ventanas = sliding_window_view(senal_rx, window_shape=long_ventana)
+    ventanas_sel = todas_ventanas[idx_sel]   # (n_sel, L) complejo
 
-    canal_I = ventanas_sel.real.astype(np.float32)         # (n_sel, L)
-    canal_Q = ventanas_sel.imag.astype(np.float32)         # (n_sel, L)
-
-    if incluir_canal_energia:
-        # Energía por muestra normalizada por la media de la ventana.
-        # El patrón de salto de energía en el centro codifica cuándo empieza
-        # la señal, complementando la información de fase de I/Q.
-        energia = canal_I ** 2 + canal_Q ** 2              # (n_sel, L)
-        mu_e = energia.mean(axis=1, keepdims=True) + 1e-8
-        canal_E = (energia / mu_e).astype(np.float32)      # (n_sel, L)
-        X = np.stack([canal_I, canal_Q, canal_E], axis=-1) # (n_sel, L, 3)
-    else:
-        X = np.stack([canal_I, canal_Q], axis=-1)          # (n_sel, L, 2)
+    X = _construir_canales(ventanas_sel, representacion)  # (n_sel, L, C)
 
     Y = np.concatenate([
         np.ones(len(idx_pos), dtype=np.int64),
         np.zeros(len(idx_neg), dtype=np.int64),
     ])
 
-    w_pos = np.ones(len(idx_pos), dtype=np.float32)
-    if len(idx_neg) > 0:
-        w_neg = np.where(
-            np.isin(idx_neg, idx_neg_hard), float(hard_neg_weight), 1.0
-        ).astype(np.float32)
-    else:
-        w_neg = np.empty(0, dtype=np.float32)
-    W = np.concatenate([w_pos, w_neg]).astype(np.float32)
+    w_neg = np.where(
+        np.isin(idx_neg, idx_neg_hard), float(hard_neg_weight), 1.0
+    ).astype(np.float32)
+    W = np.concatenate([
+        np.ones(len(idx_pos), dtype=np.float32),
+        w_neg,
+    ])
 
     return X, Y, W
 
 
 # ---------------------------------------------------------------------------
-# Generador principal: sampleo de escenarios ALOHA
+# Generador principal
 # ---------------------------------------------------------------------------
 
 def generar_dataset_desde_escenarios(
+    representacion: str = "iq",
+    modo_label: str = "onset_centro",
     n_escenarios_train: int = 200,
     n_escenarios_val: int = 50,
-    lista_G: tuple = (0.2, 0.4, 0.6, 0.8),
-    lista_SNR_dB: tuple = (0.0, 3.0, 6.0, 10.0),
+    lista_G: tuple = LISTA_G_DEFAULT,
+    lista_SNR_dB: tuple = LISTA_SNR_DEFAULT,
     ventana_frame_times: int = 50,
     ratio_undersampling: int = RATIO_UNDERSAMPLING,
     semilla_base: int = SEMILLA_BASE,
-    long_ventana: int = LONG_VENTANA,
-    diana: int = DIANA,
-    tolerancia_label: int = TOLERANCIA_LABEL,
     hard_neg_radius: int = HARD_NEG_RADIUS,
     hard_neg_weight: float = HARD_NEG_WEIGHT,
     usar_preambulo: bool = False,
-    incluir_canal_energia: bool = False,
 ) -> tuple:
     """
-    Genera dataset sampleando escenarios ALOHA reales para cubrir todo el
-    espacio operativo (G × SNR).
+    Genera el dataset completo muestreando escenarios ALOHA reales.
 
-    Prevención de data leakage:
-      Los primeros n_escenarios_train escenarios van a train;
-      los siguientes n_escenarios_val van a val.
-      Nunca se mezclan ventanas del mismo escenario en ambos conjuntos.
+    El split train/val se hace por escenario completo (sin data leakage).
 
     Retorna
     -------
-    X_train, Y_train, W_train, X_val, Y_val, W_val  (arrays NumPy)
-    X tiene forma (N, long_ventana, 2) o (N, long_ventana, 3) si incluir_canal_energia=True.
+    X_train, Y_train, W_train, X_val, Y_val, W_val
+    X : (N, L, C) float32  donde C depende de 'representacion'
+    Y : (N,) int64
+    W : (N,) float32
     """
+    if representacion not in REPRESENTACIONES_VALIDAS:
+        raise ValueError(f"representacion debe ser uno de {REPRESENTACIONES_VALIDAS}")
+
     rng = np.random.default_rng(semilla_base)
     n_total = n_escenarios_train + n_escenarios_val
-    n_cond  = len(lista_G) * len(lista_SNR_dB)
+    n_canales = IN_CHANNELS[representacion]
 
-    n_canales = 3 if incluir_canal_energia else 2
-    print(f"Generando dataset desde escenarios ALOHA reales:")
-    print(f"  Condiciones (G × SNR) : {n_cond}")
-    print(f"  Escenarios por condición: {n_total} ({n_escenarios_train} train + {n_escenarios_val} val)")
-    print(f"  Paquete: {NUM_BITS_PRE} (ZC) + {NUM_BITS_DATOS} (BPSK) = {NUM_BITS_PRE + NUM_BITS_DATOS} muestras")
-    print(f"  Ventana CNN: {long_ventana}  |  Diana: {diana}  |  Undersampling ratio: {ratio_undersampling}")
-    print(f"  Canales X: {n_canales} {'(I, Q, Energía)' if n_canales == 3 else '(I, Q)'}")
-    balance = "50/50" if ratio_undersampling == 1 else f"1:{ratio_undersampling}"
-    print(f"  Balance positivo/negativo: {balance}")
+    print(f"Dataset Fase 1")
+    print(f"  Representación : {representacion} ({n_canales} canal(es))")
+    print(f"  Modo label     : {modo_label}")
+    print(f"  Balance        : 50/50  (ratio_undersampling={ratio_undersampling})")
+    print(f"  Hard negatives : radio={hard_neg_radius}, peso={hard_neg_weight}")
+    print(f"  Escenarios     : {n_escenarios_train} train + {n_escenarios_val} val")
+    print(f"  G × SNR        : {lista_G} × {lista_SNR_dB}")
 
-    X_train_list, Y_train_list, W_train_list = [], [], []
-    X_val_list,   Y_val_list,   W_val_list   = [], [], []
+    X_tr, Y_tr, W_tr = [], [], []
+    X_vl, Y_vl, W_vl = [], [], []
 
     for g in lista_G:
         for snr in lista_SNR_dB:
             for k in range(n_total):
-                # Semilla única por (G, SNR, k) para reproducibilidad total
                 semilla_k = semilla_base + int(g * 1000) + int(snr * 100) + k
-
                 esc = generar_escenario_phy(
                     carga_G=float(g),
                     ventana_frame_times=ventana_frame_times,
@@ -244,75 +264,61 @@ def generar_dataset_desde_escenarios(
                     semilla=semilla_k,
                     usar_preambulo=usar_preambulo,
                 )
-
                 X_k, Y_k, W_k = _extraer_ventanas_y_etiquetas(
                     senal_rx=esc["senal_rx"],
                     instantes_llegada=esc["instantes_llegada_muestras"],
-                    long_ventana=long_ventana,
-                    diana=diana,
-                    tolerancia=tolerancia_label,
+                    representacion=representacion,
+                    modo_label=modo_label,
                     ratio_undersampling=ratio_undersampling,
                     hard_neg_radius=hard_neg_radius,
                     hard_neg_weight=hard_neg_weight,
-                    incluir_canal_energia=incluir_canal_energia,
                     rng=rng,
                 )
-
                 if len(X_k) == 0:
                     continue
-
-                # Split por escenario completo (anti-leakage)
                 if k < n_escenarios_train:
-                    X_train_list.append(X_k)
-                    Y_train_list.append(Y_k)
-                    W_train_list.append(W_k)
+                    X_tr.append(X_k); Y_tr.append(Y_k); W_tr.append(W_k)
                 else:
-                    X_val_list.append(X_k)
-                    Y_val_list.append(Y_k)
-                    W_val_list.append(W_k)
+                    X_vl.append(X_k); Y_vl.append(Y_k); W_vl.append(W_k)
 
-    # Concatenar todos los escenarios
-    X_train = np.concatenate(X_train_list, axis=0)
-    Y_train = np.concatenate(Y_train_list, axis=0)
-    W_train = np.concatenate(W_train_list, axis=0)
-    X_val   = np.concatenate(X_val_list,   axis=0)
-    Y_val   = np.concatenate(Y_val_list,   axis=0)
-    W_val   = np.concatenate(W_val_list,   axis=0)
+    X_train = np.concatenate(X_tr, axis=0)
+    Y_train = np.concatenate(Y_tr, axis=0)
+    W_train = np.concatenate(W_tr, axis=0)
+    X_val   = np.concatenate(X_vl, axis=0)
+    Y_val   = np.concatenate(Y_vl, axis=0)
+    W_val   = np.concatenate(W_vl, axis=0)
 
-    # Mezcla aleatoria dentro de cada conjunto (sin cruzar conjuntos)
+    # Mezcla aleatoria intra-conjunto
     idx_tr = rng.permutation(len(X_train))
     idx_vl = rng.permutation(len(X_val))
     X_train, Y_train, W_train = X_train[idx_tr], Y_train[idx_tr], W_train[idx_tr]
     X_val,   Y_val,   W_val   = X_val[idx_vl],   Y_val[idx_vl],   W_val[idx_vl]
 
-    print(f"\nResultado:")
-    print(f"  X_train: {X_train.shape}  |  positivos: {Y_train.sum()} ({100*Y_train.mean():.1f}%)")
-    print(f"  X_val  : {X_val.shape}    |  positivos: {Y_val.sum()} ({100*Y_val.mean():.1f}%)")
-    print(f"  Peso medio (train/val): {W_train.mean():.3f} / {W_val.mean():.3f}")
+    print(f"\n  X_train: {X_train.shape}  positivos: {Y_train.sum()} ({100*Y_train.mean():.1f}%)")
+    print(f"  X_val  : {X_val.shape}    positivos: {Y_val.sum()} ({100*Y_val.mean():.1f}%)")
 
     return X_train, Y_train, W_train, X_val, Y_val, W_val
 
 
 def guardar_dataset(
     directorio_salida: str,
+    representacion: str = "iq",
+    modo_label: str = "onset_centro",
     n_escenarios_train: int = 200,
     n_escenarios_val: int = 50,
-    lista_G: tuple = (0.2, 0.4, 0.6, 0.8),
-    lista_SNR_dB: tuple = (0.0, 3.0, 6.0, 10.0),
+    lista_G: tuple = LISTA_G_DEFAULT,
+    lista_SNR_dB: tuple = LISTA_SNR_DEFAULT,
     ventana_frame_times: int = 50,
     ratio_undersampling: int = RATIO_UNDERSAMPLING,
     semilla_base: int = SEMILLA_BASE,
     hard_neg_radius: int = HARD_NEG_RADIUS,
     hard_neg_weight: float = HARD_NEG_WEIGHT,
     usar_preambulo: bool = False,
-    incluir_canal_energia: bool = False,
 ) -> None:
-    """
-    Genera y guarda el dataset en formato .npy en el directorio especificado.
-    """
     os.makedirs(directorio_salida, exist_ok=True)
-
-    X_train, Y_train, W_train, X_val, Y_val, W_val = generar_dataset_desde_escenarios(
+    X_tr, Y_tr, W_tr, X_vl, Y_vl, W_vl = generar_dataset_desde_escenarios(
+        representacion=representacion,
+        modo_label=modo_label,
         n_escenarios_train=n_escenarios_train,
         n_escenarios_val=n_escenarios_val,
         lista_G=lista_G,
@@ -323,25 +329,13 @@ def guardar_dataset(
         hard_neg_radius=hard_neg_radius,
         hard_neg_weight=hard_neg_weight,
         usar_preambulo=usar_preambulo,
-        incluir_canal_energia=incluir_canal_energia,
     )
+    for nombre, arr in [("X_train", X_tr), ("Y_train", Y_tr), ("W_train", W_tr),
+                        ("X_val",   X_vl), ("Y_val",   Y_vl), ("W_val",   W_vl)]:
+        np.save(os.path.join(directorio_salida, f"{nombre}.npy"), arr)
 
-    np.save(os.path.join(directorio_salida, "X_train.npy"), X_train)
-    np.save(os.path.join(directorio_salida, "Y_train.npy"), Y_train)
-    np.save(os.path.join(directorio_salida, "W_train.npy"), W_train)
-    np.save(os.path.join(directorio_salida, "X_val.npy"),   X_val)
-    np.save(os.path.join(directorio_salida, "Y_val.npy"),   Y_val)
-    np.save(os.path.join(directorio_salida, "W_val.npy"),   W_val)
-
-    tam_mb = (X_train.nbytes + X_val.nbytes) / 1e6
-    print(f"\nDataset guardado en: {directorio_salida}")
-    print(f"  X_train.npy : {X_train.shape}  {X_train.dtype}")
-    print(f"  Y_train.npy : {Y_train.shape}  {Y_train.dtype}")
-    print(f"  W_train.npy : {W_train.shape}  {W_train.dtype}")
-    print(f"  X_val.npy   : {X_val.shape}    {X_val.dtype}")
-    print(f"  Y_val.npy   : {Y_val.shape}    {Y_val.dtype}")
-    print(f"  W_val.npy   : {W_val.shape}    {W_val.dtype}")
-    print(f"  Tamaño en disco: ~{tam_mb:.0f} MB")
+    tam_mb = (X_tr.nbytes + X_vl.nbytes) / 1e6
+    print(f"\nDataset guardado en '{directorio_salida}' (~{tam_mb:.0f} MB)")
 
 
 # ---------------------------------------------------------------------------
@@ -349,29 +343,32 @@ def guardar_dataset(
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Genera dataset de detección CNN desde escenarios ALOHA reales."
+        description="Genera dataset Fase 1 desde escenarios ALOHA reales."
     )
-    parser.add_argument("--salida",            type=str,   default="data/dataset_aloha",
-                        help="Directorio de salida para los .npy del dataset.")
-    parser.add_argument("--usar_preambulo",    action="store_true", default=False,
-                        help="Incluye preámbulo ZC en los paquetes (detector con preámbulo).")
-    parser.add_argument("--incluir_energia",   action="store_true", default=False,
-                        help="Añade canal de energía normalizada (3er canal). Necesario para ModeloCNNv3.")
+    parser.add_argument("--representacion", type=str, default="iq",
+                        choices=list(REPRESENTACIONES_VALIDAS),
+                        help="Representación de entrada: 'energia', 'iq' o 'iq_energia'.")
+    parser.add_argument("--modo_label", type=str, default="onset_centro",
+                        choices=["onset_centro", "ventana_llena"],
+                        help="Definición del positivo. 'onset_centro' (Fase 1) o 'ventana_llena' (Fase 2).")
+    parser.add_argument("--salida", type=str, default=None,
+                        help="Directorio de salida. Por defecto: data/fase1_<representacion>_<modo_label>")
     parser.add_argument("--n_train",           type=int,   default=200)
     parser.add_argument("--n_val",             type=int,   default=50)
-    parser.add_argument("--ventana_ft",        type=int,   default=50,
-                        help="Duración de cada escenario en frame times.")
-    parser.add_argument("--ratio_undersample", type=int,   default=RATIO_UNDERSAMPLING,
-                        help="Negativos por positivo (1 = dataset 50/50, 10 = default desbalanceado).")
+    parser.add_argument("--ventana_ft",        type=int,   default=50)
+    parser.add_argument("--ratio_undersample", type=int,   default=RATIO_UNDERSAMPLING)
     parser.add_argument("--semilla",           type=int,   default=SEMILLA_BASE)
-    parser.add_argument("--hard_neg_radius",   type=int,   default=HARD_NEG_RADIUS,
-                        help="Radio de hard negatives en muestras (recomendado: 8 para v3).")
-    parser.add_argument("--hard_neg_weight",   type=float, default=HARD_NEG_WEIGHT,
-                        help="Peso extra de hard negatives en la pérdida.")
+    parser.add_argument("--hard_neg_radius",   type=int,   default=HARD_NEG_RADIUS)
+    parser.add_argument("--hard_neg_weight",   type=float, default=HARD_NEG_WEIGHT)
+    parser.add_argument("--usar_preambulo",    action="store_true", default=False)
     args = parser.parse_args()
 
+    salida = args.salida or f"data/fase1_{args.representacion}_{args.modo_label}"
+
     guardar_dataset(
-        directorio_salida=args.salida,
+        directorio_salida=salida,
+        representacion=args.representacion,
+        modo_label=args.modo_label,
         n_escenarios_train=args.n_train,
         n_escenarios_val=args.n_val,
         ventana_frame_times=args.ventana_ft,
@@ -380,5 +377,4 @@ if __name__ == "__main__":
         hard_neg_radius=args.hard_neg_radius,
         hard_neg_weight=args.hard_neg_weight,
         usar_preambulo=args.usar_preambulo,
-        incluir_canal_energia=args.incluir_energia,
     )

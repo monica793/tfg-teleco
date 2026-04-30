@@ -24,8 +24,8 @@ def generar_escenario_phy(
     carga_G,
     ventana_frame_times,
     snr_db,
-    num_bits_pre=13,
-    num_bits_datos=20,
+    num_bits_pre=23,
+    num_bits_datos=105,
     semilla=None,
     margen_muestras=None,
     incluir_mascara_colision_mac=True,
@@ -140,7 +140,7 @@ def generar_escenario_phy(
 
 def ejecutar_receptor_correlador(escenario, tau, separacion_minima):
     """
-    Receptor PHY clásico: correlación + picos con NMS.
+    Receptor PHY clásico: correlación + umbral.
 
     Retorna
     -------
@@ -309,6 +309,7 @@ def ejecutar_receptor_neuronal(
     modelo,
     umbral: float,
     separacion_minima: int,
+    temperature: float = 1.0,
     dispositivo: str = "cpu",
     stride: int = 1,
     batch_size: int = 1024,
@@ -327,7 +328,8 @@ def ejecutar_receptor_neuronal(
     escenario        : dict generado por generar_escenario_phy()
     modelo           : ModeloCNN ya entrenado (nn.Module en modo eval)
     umbral           : umbral de probabilidad en [0, 1] para declarar detección
-    separacion_minima: distancia mínima entre picos en muestras (NMS)
+    separacion_minima: parámetro legado sin uso (se mantiene por compatibilidad)
+    temperature      : factor de temperature scaling (>0). 1.0 = sin calibración
     dispositivo      : 'cpu' o 'cuda'
     stride           : paso de la ventana deslizante (1 = resolución máxima)
     batch_size       : número de ventanas por batch de inferencia
@@ -341,6 +343,9 @@ def ejecutar_receptor_neuronal(
         instantes_detectados: np.ndarray int64 — instantes con score >= umbral tras NMS
     """
     import torch
+
+    if float(temperature) <= 0.0:
+        raise ValueError("temperature debe ser > 0")
 
     senal_rx = np.asarray(escenario["senal_rx"])
     N = len(senal_rx)
@@ -362,28 +367,63 @@ def ejecutar_receptor_neuronal(
         ventanas_iq[i, :, 0] = seg.real.astype(np.float32)
         ventanas_iq[i, :, 1] = seg.imag.astype(np.float32)
 
-    # (N_ventanas, 128, 2) → (N_ventanas, 2, 128) para Conv1d
+    # Detectar canales esperados por el modelo
+    # ModeloFase1 → modelo.in_channels
+    # Modelos legacy → backbone[0].in_channels o bloques_conv[0].in_channels
+    in_ch = 2  # default IQ
+    if hasattr(modelo, "in_channels"):
+        in_ch = int(modelo.in_channels)
+    elif hasattr(modelo, "backbone"):
+        in_ch = int(modelo.backbone[0].in_channels)
+    elif hasattr(modelo, "bloques_conv"):
+        in_ch = int(modelo.bloques_conv[0].in_channels)
+
+    I = ventanas_iq[:, :, 0]   # (N, L)
+    Q = ventanas_iq[:, :, 1]   # (N, L)
+
+    if in_ch == 1:
+        # Solo energía normalizada
+        E = I ** 2 + Q ** 2
+        mu = E.mean(axis=1, keepdims=True) + 1e-8
+        ventanas = (E / mu).astype(np.float32)[:, :, None]   # (N, L, 1)
+    elif in_ch == 3:
+        # IQ + energía normalizada
+        E = I ** 2 + Q ** 2
+        mu = E.mean(axis=1, keepdims=True) + 1e-8
+        E_norm = (E / mu).astype(np.float32)
+        ventanas = np.concatenate([ventanas_iq, E_norm[:, :, None]], axis=2)  # (N,L,3)
+    else:
+        ventanas = ventanas_iq  # (N, L, 2)
+
+    # (N, L, C) → (N, C, L) para Conv1d
     ventanas_tensor = torch.from_numpy(
-        np.transpose(ventanas_iq, (0, 2, 1))
+        np.transpose(ventanas, (0, 2, 1))
     ).to(dispositivo)
 
     modelo = modelo.to(dispositivo)
     modelo.eval()
 
+    # Detectar si el modelo es binario (1 logit) o multiclase (N logits)
+    num_clases = getattr(modelo, "num_clases", 1)
+
     scores_ventanas = np.empty(n_ventanas, dtype=np.float32)
     with torch.no_grad():
         for inicio_batch in range(0, n_ventanas, batch_size):
             fin_batch = min(inicio_batch + batch_size, n_ventanas)
-            logits = modelo(ventanas_tensor[inicio_batch:fin_batch])  # (B, 1)
-            probs = torch.sigmoid(logits).squeeze(1).cpu().numpy()
-            scores_ventanas[inicio_batch:fin_batch] = probs
+            logits = modelo(ventanas_tensor[inicio_batch:fin_batch])  # (B, num_clases)
+            if num_clases == 1:
+                probs = torch.sigmoid(logits / float(temperature)).squeeze(1)
+            else:
+                # Score = P(C1) según softmax; C1 es la clase de inicio/evento
+                probs = torch.softmax(logits / float(temperature), dim=1)[:, 1]
+            scores_ventanas[inicio_batch:fin_batch] = probs.cpu().numpy()
 
     # Asignar cada score a la muestra "diana" de su ventana
     score_por_muestra = np.zeros(N, dtype=np.float32)
     diana_indices = indices_inicio + mitad
     np.maximum.at(score_por_muestra, diana_indices, scores_ventanas)
 
-    # NMS sobre el score usando la misma función que el correlador
+    # Detecciones por umbral simple (sin NMS)
     instantes_detectados = buscar_picos_preambulo(
         corr_norm=score_por_muestra,
         tau=umbral,
@@ -409,6 +449,7 @@ def ejecutar_monte_carlo_roc_neuronal(
     dispositivo="cpu",
     stride=1,
     long_ventana=128,
+    temperature=1.0,
     taus=None,
     usar_preambulo=False,
 ):
@@ -447,6 +488,7 @@ def ejecutar_monte_carlo_roc_neuronal(
             modelo=modelo,
             umbral=0.5,  # no afecta a ROC; aquí solo se usa score_por_muestra
             separacion_minima=num_bits_pre + num_bits_datos,
+            temperature=temperature,
             dispositivo=dispositivo,
             stride=stride,
             long_ventana=long_ventana,

@@ -1,25 +1,23 @@
 """
-Entrenamiento del detector ciego (sin preámbulo) con PyTorch Lightning y WandB.
+Entrenamiento de ModeloFase1 con PyTorch Lightning.
 
-Uso básico (local, CPU):
-  python -m ml.entrenar_modelo --datos data/dataset_aloha --epochs 50
+Uso básico:
+  # Generar dataset primero:
+  python -m ml.generar_dataset --representacion iq --salida data/fase1_iq_onset_centro
 
-Uso en Google Colab (GPU):
-  python -m ml.entrenar_modelo --datos /content/dataset_aloha --epochs 50
+  # Entrenar:
+  python -m ml.entrenar_modelo \\
+      --datos data/fase1_iq_onset_centro \\
+      --representacion iq \\
+      --sin_wandb
 
-El script espera que los archivos X_train.npy, Y_train.npy, X_val.npy y
-Y_val.npy ya existan en el directorio `--datos`. Opcionalmente puede cargar
-W_train.npy / W_val.npy para ponderar la pérdida (hard negatives cercanos).
-Si no existen, se usan pesos unitarios.
-Si no existen los datos, se puede
-generar el dataset primero con:
-  python -m ml.generar_dataset --salida data/dataset_aloha
+El nombre del checkpoint se genera automáticamente con la configuración del experimento:
+  <representacion>_<modo_label>-epoch=XX-val_loss=X.XXXX.ckpt
+  Ejemplo: iq_onset_centro-epoch=12-val_loss=0.4231.ckpt
 
-Estructura Lightning:
-  ALOHADataModule  : carga y sirve los datos en DataLoader.
-  DetectorALOHA    : envuelve ModeloCNN con paso de entrenamiento/validación.
-  Trainer          : configura callbacks (ModelCheckpoint, EarlyStopping) y
-                     el logger WandbLogger.
+Extensibilidad futura:
+  --num_clases 3  →  CrossEntropyLoss para multiclase (Fase 3)
+  --modo_label ventana_llena  →  Fase 2 (solo cambia qué nombre tiene el dataset)
 """
 
 import argparse
@@ -34,15 +32,7 @@ import lightning as L
 from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
 from lightning.pytorch.loggers import WandbLogger
 
-from ml.modelo import ModeloCNN, ModeloCNNLegacy, ModeloCNNv3
-from ml.modelo_energia import ModeloCNNEnergia
-
-MODELOS_DISPONIBLES = {
-    "iq":        ModeloCNN,
-    "iq_legacy": ModeloCNNLegacy,
-    "energia":   ModeloCNNEnergia,
-    "v3":        ModeloCNNv3,
-}
+from ml.modelo_fase1 import ModeloFase1, IN_CHANNELS
 
 
 # ---------------------------------------------------------------------------
@@ -51,11 +41,10 @@ MODELOS_DISPONIBLES = {
 
 class ALOHADataModule(L.LightningDataModule):
     """
-    Carga X_train.npy / Y_train.npy / X_val.npy / Y_val.npy desde disco y
-    los expone como DataLoaders de PyTorch.
+    Carga X_train/Y_train/W_train y X_val/Y_val/W_val desde disco.
 
-    Los arrays en disco tienen formato (N, 128, 2) [muestra, I/Q].
-    PyTorch necesita (N, 2, 128) [canal, muestra], por lo que se transpone al cargar.
+    Transpone (N, L, C) → (N, C, L) para Conv1d.
+    Compatible con cualquier número de canales (1, 2 o 3).
     """
 
     def __init__(self, directorio_datos: str, batch_size: int = 512, num_workers: int = 0):
@@ -64,158 +53,127 @@ class ALOHADataModule(L.LightningDataModule):
         self.batch_size = batch_size
         self.num_workers = num_workers
 
-    def setup(self, stage: str | None = None):
-        X_train = np.load(os.path.join(self.directorio_datos, "X_train.npy"))
-        Y_train = np.load(os.path.join(self.directorio_datos, "Y_train.npy"))
-        X_val = np.load(os.path.join(self.directorio_datos, "X_val.npy"))
-        Y_val = np.load(os.path.join(self.directorio_datos, "Y_val.npy"))
+    def _cargar(self, split: str):
+        X = np.load(os.path.join(self.directorio_datos, f"X_{split}.npy"))
+        Y = np.load(os.path.join(self.directorio_datos, f"Y_{split}.npy"))
+        ruta_w = os.path.join(self.directorio_datos, f"W_{split}.npy")
+        W = np.load(ruta_w).astype(np.float32) if os.path.exists(ruta_w) \
+            else np.ones(len(Y), dtype=np.float32)
+        X = np.transpose(X, (0, 2, 1))  # (N, L, C) → (N, C, L)
+        return (torch.from_numpy(X),
+                torch.from_numpy(Y).float(),
+                torch.from_numpy(W).float())
 
-        ruta_w_train = os.path.join(self.directorio_datos, "W_train.npy")
-        ruta_w_val = os.path.join(self.directorio_datos, "W_val.npy")
-        if os.path.exists(ruta_w_train) and os.path.exists(ruta_w_val):
-            W_train = np.load(ruta_w_train).astype(np.float32)
-            W_val = np.load(ruta_w_val).astype(np.float32)
-            print("[DataModule] Pesos de pérdida detectados: W_train.npy / W_val.npy")
-        else:
-            W_train = np.ones_like(Y_train, dtype=np.float32)
-            W_val = np.ones_like(Y_val, dtype=np.float32)
-            print("[DataModule] Sin pesos W_*.npy: se usan pesos unitarios")
-
-        # (N, 128, 2) → (N, 2, 128) para Conv1d
-        X_train = np.transpose(X_train, (0, 2, 1))
-        X_val = np.transpose(X_val, (0, 2, 1))
-
-        self.ds_train = TensorDataset(
-            torch.from_numpy(X_train),
-            torch.from_numpy(Y_train).float(),
-            torch.from_numpy(W_train).float(),
-        )
-        self.ds_val = TensorDataset(
-            torch.from_numpy(X_val),
-            torch.from_numpy(Y_val).float(),
-            torch.from_numpy(W_val).float(),
-        )
+    def setup(self, stage=None):
+        self.ds_train = TensorDataset(*self._cargar("train"))
+        self.ds_val   = TensorDataset(*self._cargar("val"))
 
     def train_dataloader(self):
-        return DataLoader(
-            self.ds_train,
-            batch_size=self.batch_size,
-            shuffle=True,
-            num_workers=self.num_workers,
-            persistent_workers=self.num_workers > 0,
-        )
+        return DataLoader(self.ds_train, batch_size=self.batch_size, shuffle=True,
+                          num_workers=self.num_workers,
+                          persistent_workers=self.num_workers > 0)
 
     def val_dataloader(self):
-        return DataLoader(
-            self.ds_val,
-            batch_size=self.batch_size,
-            shuffle=False,
-            num_workers=self.num_workers,
-            persistent_workers=self.num_workers > 0,
-        )
+        return DataLoader(self.ds_val, batch_size=self.batch_size, shuffle=False,
+                          num_workers=self.num_workers,
+                          persistent_workers=self.num_workers > 0)
 
 
 # ---------------------------------------------------------------------------
 # LightningModule
 # ---------------------------------------------------------------------------
 
-class DetectorALOHA(L.LightningModule):
+class DetectorLightning(L.LightningModule):
     """
-    Módulo de entrenamiento para el detector CNN 1D de inicio de paquete.
+    Módulo de entrenamiento genérico para ModeloFase1.
 
-    Pérdida: BCEWithLogitsLoss con reducción none + promedio ponderado por muestra.
-    Optimizador: Adam con lr inicial 1e-3.
-    Scheduler: ReduceLROnPlateau sobre val_loss (factor 0.5, paciencia 5 épocas).
+    Pérdida:
+      num_clases=1 → BCEWithLogitsLoss con pesos por muestra
+      num_clases>1 → CrossEntropyLoss con pesos por muestra (Fase 3)
     """
 
-    def __init__(self, lr: float = 1e-3, dropout: float = 0.3, tipo_modelo: str = "iq", pos_weight: float = 1.0):
+    def __init__(self, in_channels: int = 2, num_clases: int = 1,
+                 lr: float = 1e-3, dropout: float = 0.3):
         super().__init__()
         self.save_hyperparameters()
-        clase_modelo = MODELOS_DISPONIBLES.get(tipo_modelo, ModeloCNN)
-        self.modelo = clase_modelo(dropout=dropout)
-        # pos_weight registrado como buffer para moverse automáticamente a GPU/CPU
-        self.register_buffer("pw", torch.tensor([float(pos_weight)]))
-        self.criterio = nn.BCEWithLogitsLoss(reduction="none")
+        self.modelo = ModeloFase1(in_channels=in_channels, num_clases=num_clases,
+                                   dropout=dropout)
+        self.binario = (num_clases == 1)
+        self.criterio = (nn.BCEWithLogitsLoss(reduction="none") if self.binario
+                         else nn.CrossEntropyLoss(reduction="none"))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
         return self.modelo(x)
 
     def _paso_comun(self, batch, etapa: str):
         x, y, w = batch
-        logit = self(x).squeeze(1)       # (N,)
-        # pos_weight amplifica el gradiente de los positivos
-        pw_per_sample = torch.where(y > 0.5, self.pw.expand_as(y), torch.ones_like(y))
-        loss_vec = self.criterio(logit, y)
-        loss = (loss_vec * w * pw_per_sample).sum() / torch.clamp((w * pw_per_sample).sum(), min=1e-8)
+        out = self(x)  # (N, num_clases)
+
+        if self.binario:
+            logit = out.squeeze(1)          # (N,)
+            loss_vec = self.criterio(logit, y)
+        else:
+            # CrossEntropyLoss espera (N, C) logits y (N,) targets long
+            loss_vec = self.criterio(out, y.long())
+
+        loss = (loss_vec * w).sum() / torch.clamp(w.sum(), min=1e-8)
 
         with torch.no_grad():
-            pred = (torch.sigmoid(logit) >= 0.5).float()
+            if self.binario:
+                pred = (torch.sigmoid(out.squeeze(1)) >= 0.5).float()
+            else:
+                pred = out.argmax(dim=1).float()
             acc = (pred == y).float().mean()
 
-        # Loguear por época (no por paso) para evitar saturar la salida en Colab.
         self.log(f"{etapa}_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
-        self.log(f"{etapa}_acc", acc, on_step=False, on_epoch=True, prog_bar=True)
+        self.log(f"{etapa}_acc",  acc,  on_step=False, on_epoch=True, prog_bar=True)
         return loss
 
-    def training_step(self, batch, batch_idx):
+    def training_step(self, batch, _):
         return self._paso_comun(batch, "train")
 
-    def validation_step(self, batch, batch_idx):
+    def validation_step(self, batch, _):
         self._paso_comun(batch, "val")
 
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=self.hparams.lr)
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode="min", factor=0.5, patience=5
-        )
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": {"scheduler": scheduler, "monitor": "val_loss"},
-        }
+        opt = torch.optim.Adam(self.parameters(), lr=self.hparams.lr)
+        sch = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="min",
+                                                          factor=0.5, patience=5)
+        return {"optimizer": opt, "lr_scheduler": {"scheduler": sch, "monitor": "val_loss"}}
 
 
 # ---------------------------------------------------------------------------
-# Función principal de entrenamiento
+# Función principal
 # ---------------------------------------------------------------------------
 
 def entrenar(
     directorio_datos: str,
+    representacion: str = "iq",
+    modo_label: str = "onset_centro",
+    num_clases: int = 1,
     directorio_ckpt: str = "checkpoints",
-    max_epochs: int = 50,
+    max_epochs: int = 80,
     batch_size: int = 512,
     lr: float = 1e-3,
     dropout: float = 0.3,
     usar_wandb: bool = True,
     proyecto_wandb: str = "tfg-aloha-detector",
     num_workers: int = 0,
-    tipo_modelo: str = "iq",
-    pos_weight: float = 1.0,
-    nombre_ckpt: str = "mejor",
-):
+) -> str:
     """
-    Lanza el entrenamiento completo con PyTorch Lightning.
+    Entrena ModeloFase1 y guarda el mejor checkpoint.
 
-    Parámetros
-    ----------
-    directorio_datos  : carpeta con los archivos .npy del dataset.
-    directorio_ckpt   : carpeta donde se guarda el mejor checkpoint.
-    max_epochs        : número máximo de épocas.
-    batch_size        : tamaño del batch.
-    lr                : tasa de aprendizaje inicial de Adam.
-    dropout           : tasa de Dropout en la cabeza densa.
-    usar_wandb        : si True, activa el logger de Weights & Biases.
-    proyecto_wandb    : nombre del proyecto en WandB.
-    num_workers       : workers para DataLoader (0 = sin multiprocessing).
-    nombre_ckpt       : prefijo del nombre del checkpoint guardado.
-                        Ejemplo: 'v3_5050_HN8' → 'v3_5050_HN8-epoch=XX-val_loss=X.XXXX.ckpt'.
+    El nombre del checkpoint incluye la configuración del experimento para
+    facilitar su identificación sin abrir el fichero:
+      <representacion>_<modo_label>-epoch=XX-val_loss=X.XXXX.ckpt
     """
-    datamodule = ALOHADataModule(
-        directorio_datos=directorio_datos,
-        batch_size=batch_size,
-        num_workers=num_workers,
-    )
+    in_channels = IN_CHANNELS[representacion]
+    nombre_ckpt = f"{representacion}_{modo_label}"
 
-    modelo_lightning = DetectorALOHA(lr=lr, dropout=dropout, tipo_modelo=tipo_modelo, pos_weight=pos_weight)
+    datamodule = ALOHADataModule(directorio_datos, batch_size=batch_size,
+                                  num_workers=num_workers)
+    modelo = DetectorLightning(in_channels=in_channels, num_clases=num_clases,
+                                lr=lr, dropout=dropout)
 
     callbacks = [
         ModelCheckpoint(
@@ -225,71 +183,56 @@ def entrenar(
             mode="min",
             save_top_k=1,
         ),
-        EarlyStopping(
-            monitor="val_loss",
-            patience=10,
-            mode="min",
-            verbose=True,
-        ),
+        EarlyStopping(monitor="val_loss", patience=10, mode="min", verbose=True),
     ]
 
-    loggers = []
-    if usar_wandb:
-        loggers.append(WandbLogger(project=proyecto_wandb, log_model=False))
+    loggers = [WandbLogger(project=proyecto_wandb, log_model=False)] if usar_wandb else []
 
     trainer = L.Trainer(
         max_epochs=max_epochs,
         callbacks=callbacks,
-        # Sin WandB: desactivar logger para reducir overhead y ruido en notebook.
         logger=loggers if loggers else False,
-        # Menos frecuencia de actualización de progreso para no saturar el navegador.
         log_every_n_steps=200,
         enable_model_summary=False,
-        accelerator="auto",   # CPU local; GPU en Colab automáticamente
+        accelerator="auto",
         devices=1,
     )
 
-    trainer.fit(modelo_lightning, datamodule=datamodule)
-
-    mejor_ckpt = trainer.checkpoint_callback.best_model_path
-    print(f"\nEntrenamiento finalizado. Mejor checkpoint: {mejor_ckpt}")
-    return mejor_ckpt
+    trainer.fit(modelo, datamodule=datamodule)
+    mejor = trainer.checkpoint_callback.best_model_path
+    print(f"\nMejor checkpoint: {mejor}")
+    return mejor
 
 
 # ---------------------------------------------------------------------------
-# Ejecución desde línea de comandos
+# CLI
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Entrena el detector CNN 1D con PyTorch Lightning.")
-    parser.add_argument("--datos", type=str, default="data/dataset_aloha",
-                        help="Directorio con X_train.npy, Y_train.npy, X_val.npy, Y_val.npy")
-    parser.add_argument("--ckpt", type=str, default="checkpoints",
-                        help="Directorio de salida para el mejor checkpoint")
-    parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--batch", type=int, default=512)
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--dropout", type=float, default=0.3)
-    parser.add_argument("--sin_wandb", action="store_true",
-                        help="Desactiva WandB (útil para pruebas locales rápidas)")
-    parser.add_argument("--workers", type=int, default=0)
-    parser.add_argument("--modelo", type=str, default="iq",
-                        choices=list(MODELOS_DISPONIBLES.keys()),
-                        help="Arquitectura: 'iq', 'iq_legacy', 'energia' o 'v3' (IQ+Energía, sin pool).")
-    parser.add_argument("--pos_weight", type=float, default=1.0,
-                        help="Peso de los positivos en la pérdida (>1 fuerza más detecciones). "
-                             "Con dataset 50/50 (v3) usar 1.0.")
-    parser.add_argument("--nombre_ckpt", type=str, default=None,
-                        help="Prefijo del checkpoint guardado. Si no se indica, se usa el nombre "
-                             "del modelo (p.ej. 'v3_5050_HN8'). "
-                             "Resultado: <prefijo>-epoch=XX-val_loss=X.XXXX.ckpt")
+    parser = argparse.ArgumentParser(description="Entrena ModeloFase1.")
+    parser.add_argument("--datos",           type=str,   required=True,
+                        help="Directorio con los .npy del dataset.")
+    parser.add_argument("--representacion",  type=str,   default="iq",
+                        choices=["energia", "iq", "iq_energia"],
+                        help="Representación de entrada (debe coincidir con la del dataset).")
+    parser.add_argument("--modo_label",      type=str,   default="onset_centro",
+                        choices=["onset_centro", "ventana_llena"],
+                        help="Modo de etiquetado (informativo para el nombre del checkpoint).")
+    parser.add_argument("--num_clases",      type=int,   default=1,
+                        help="1=binario (Fase 1/2), 3=multiclase (Fase 3).")
+    parser.add_argument("--ckpt",            type=str,   default="checkpoints")
+    parser.add_argument("--epochs",          type=int,   default=80)
+    parser.add_argument("--batch",           type=int,   default=512)
+    parser.add_argument("--lr",              type=float, default=1e-3)
+    parser.add_argument("--dropout",         type=float, default=0.3)
+    parser.add_argument("--sin_wandb",       action="store_true")
+    parser.add_argument("--workers",         type=int,   default=0)
     args = parser.parse_args()
-
-    # Nombre de checkpoint: si el usuario no lo especifica, se genera automáticamente
-    # con el tipo de modelo para facilitar la identificación posterior.
-    nombre_ckpt = args.nombre_ckpt if args.nombre_ckpt else args.modelo
 
     entrenar(
         directorio_datos=args.datos,
+        representacion=args.representacion,
+        modo_label=args.modo_label,
+        num_clases=args.num_clases,
         directorio_ckpt=args.ckpt,
         max_epochs=args.epochs,
         batch_size=args.batch,
@@ -297,7 +240,4 @@ if __name__ == "__main__":
         dropout=args.dropout,
         usar_wandb=not args.sin_wandb,
         num_workers=args.workers,
-        tipo_modelo=args.modelo,
-        pos_weight=args.pos_weight,
-        nombre_ckpt=nombre_ckpt,
     )
