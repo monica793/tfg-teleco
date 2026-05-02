@@ -138,7 +138,7 @@ def generar_escenario_phy(
     return escenario
 
 
-def ejecutar_receptor_correlador(escenario, tau, separacion_minima):
+def ejecutar_receptor_correlador(escenario, tau):
     """
     Receptor PHY clásico: correlación + umbral.
 
@@ -153,7 +153,7 @@ def ejecutar_receptor_correlador(escenario, tau, separacion_minima):
             "El correlador requiere preámbulo, pero el escenario fue generado con usar_preambulo=False."
         )
     corr_norm = correlador(senal_rx, preambulo)
-    picos = buscar_picos_preambulo(corr_norm, tau=tau, separacion_minima=separacion_minima)
+    picos = buscar_picos_preambulo(corr_norm, tau=tau)
     return {"instantes_detectados": picos, "corr_norm": corr_norm}
 
 
@@ -163,7 +163,6 @@ def ejecutar_monte_carlo_receptor_correlador(
     snr_db,
     tau,
     tolerancia_muestras,
-    separacion_minima,
     num_iteraciones,
     semilla_base=0,
     num_bits_pre=13,
@@ -192,7 +191,6 @@ def ejecutar_monte_carlo_receptor_correlador(
         sal_corr = ejecutar_receptor_correlador(
             esc,
             tau=tau,
-            separacion_minima=separacion_minima,
         )
         metricas = evaluar_detecciones(
             esc["instantes_llegada_muestras"],
@@ -308,12 +306,12 @@ def ejecutar_receptor_neuronal(
     escenario: dict,
     modelo,
     umbral: float,
-    separacion_minima: int,
     temperature: float = 1.0,
     dispositivo: str = "cpu",
     stride: int = 1,
     batch_size: int = 1024,
     long_ventana: int = 128,
+    devolver_clases: bool = False,
 ):
     """
     Receptor PHY basado en red neuronal CNN 1D.
@@ -328,7 +326,6 @@ def ejecutar_receptor_neuronal(
     escenario        : dict generado por generar_escenario_phy()
     modelo           : ModeloCNN ya entrenado (nn.Module en modo eval)
     umbral           : umbral de probabilidad en [0, 1] para declarar detección
-    separacion_minima: parámetro legado sin uso (se mantiene por compatibilidad)
     temperature      : factor de temperature scaling (>0). 1.0 = sin calibración
     dispositivo      : 'cpu' o 'cuda'
     stride           : paso de la ventana deslizante (1 = resolución máxima)
@@ -340,7 +337,8 @@ def ejecutar_receptor_neuronal(
     dict con:
         score_por_muestra  : np.ndarray float32 (len senal_rx,) — score en [0,1]
                              (0 fuera del alcance de la ventana)
-        instantes_detectados: np.ndarray int64 — instantes con score >= umbral tras NMS
+        instantes_detectados: np.ndarray int64 — instantes con score >= umbral
+        class_por_muestra   : np.ndarray int64 opcional (solo si devolver_clases=True y multiclase)
     """
     import torch
 
@@ -423,17 +421,31 @@ def ejecutar_receptor_neuronal(
     diana_indices = indices_inicio + mitad
     np.maximum.at(score_por_muestra, diana_indices, scores_ventanas)
 
+    class_por_muestra = None
+    if devolver_clases and num_clases > 1:
+        # Clase ganadora por ventana; se asigna a la muestra diana correspondiente.
+        class_por_muestra = np.zeros(N, dtype=np.int64)
+        pred_clase_ventana = np.empty(n_ventanas, dtype=np.int64)
+        with torch.no_grad():
+            for inicio_batch in range(0, n_ventanas, batch_size):
+                fin_batch = min(inicio_batch + batch_size, n_ventanas)
+                logits = modelo(ventanas_tensor[inicio_batch:fin_batch])
+                pred_clase_ventana[inicio_batch:fin_batch] = logits.argmax(dim=1).cpu().numpy().astype(np.int64)
+        class_por_muestra[diana_indices] = pred_clase_ventana
+
     # Detecciones por umbral simple (sin NMS)
     instantes_detectados = buscar_picos_preambulo(
         corr_norm=score_por_muestra,
         tau=umbral,
-        separacion_minima=separacion_minima,
     )
 
-    return {
+    salida = {
         "score_por_muestra": score_por_muestra,
         "instantes_detectados": instantes_detectados,
     }
+    if class_por_muestra is not None:
+        salida["class_por_muestra"] = class_por_muestra
+    return salida
 
 
 def ejecutar_monte_carlo_roc_neuronal(
@@ -487,7 +499,6 @@ def ejecutar_monte_carlo_roc_neuronal(
             escenario=esc,
             modelo=modelo,
             umbral=0.5,  # no afecta a ROC; aquí solo se usa score_por_muestra
-            separacion_minima=num_bits_pre + num_bits_datos,
             temperature=temperature,
             dispositivo=dispositivo,
             stride=stride,
@@ -531,7 +542,6 @@ def barrer_grid_protocolo_correlador(
     ventana_frame_times,
     tau_evento,
     tolerancia_muestras,
-    separacion_minima,
     num_iteraciones,
     semilla_base,
     num_bits_pre=13,
@@ -549,7 +559,6 @@ def barrer_grid_protocolo_correlador(
                 snr_db=snr,
                 tau=tau_evento,
                 tolerancia_muestras=tolerancia_muestras,
-                separacion_minima=separacion_minima,
                 num_iteraciones=num_iteraciones,
                 semilla_base=semilla_base,
                 num_bits_pre=num_bits_pre,

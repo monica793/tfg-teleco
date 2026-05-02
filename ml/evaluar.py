@@ -403,3 +403,41 @@ def comparar_representaciones(
             w.writeheader()
             w.writerows(filas)
         print(f"CSV guardado: {ruta_salida}")
+
+
+def etiquetas_multiclase_por_onset(
+    n_muestras: int,
+    instantes_verdaderos: np.ndarray,
+    k_c1: int = 2,
+    k_c2: int = 12,
+) -> np.ndarray:
+    """
+    Construye etiqueta multiclase por índice de muestra:
+      C1: |d| <= k_c1
+      C2: k_c1 < |d| <= k_c2
+      C0: resto
+    donde d es distancia al onset más cercano.
+    """
+    y = np.zeros(n_muestras, dtype=np.int64)
+    if len(instantes_verdaderos) == 0:
+        return y
+    dmin = np.full(n_muestras, np.inf, dtype=float)
+    idx = np.arange(n_muestras, dtype=np.int64)
+    for t in instantes_verdaderos:
+        dmin = np.minimum(dmin, np.abs(idx - int(t)))
+    y[dmin <= k_c1] = 1
+    y[(dmin > k_c1) & (dmin <= k_c2)] = 2
+    return y
+
+
+def matriz_confusion_multiclase(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    num_clases: int = 3,
+) -> np.ndarray:
+    """Matriz de confusión CxC para clases enteras [0..C-1]."""
+    cm = np.zeros((num_clases, num_clases), dtype=np.int64)
+    for t, p in zip(y_true.astype(int), y_pred.astype(int)):
+        if 0 <= t < num_clases and 0 <= p < num_clases:
+            cm[t, p] += 1
+    return cm

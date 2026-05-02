@@ -17,7 +17,7 @@ El nombre del checkpoint se genera automáticamente con la configuración del ex
 
 Extensibilidad futura:
   --num_clases 3  →  CrossEntropyLoss para multiclase (Fase 3)
-  --modo_label ventana_llena  →  Fase 2 (solo cambia qué nombre tiene el dataset)
+  --modo_label ventana_llena / multiclase_onset  →  Fase 2/3
 """
 
 import argparse
@@ -215,7 +215,7 @@ if __name__ == "__main__":
                         choices=["energia", "iq", "iq_energia"],
                         help="Representación de entrada (debe coincidir con la del dataset).")
     parser.add_argument("--modo_label",      type=str,   default="onset_centro",
-                        choices=["onset_centro", "ventana_llena"],
+                        choices=["onset_centro", "ventana_llena", "multiclase_onset"],
                         help="Modo de etiquetado (informativo para el nombre del checkpoint).")
     parser.add_argument("--num_clases",      type=int,   default=1,
                         help="1=binario (Fase 1/2), 3=multiclase (Fase 3).")
