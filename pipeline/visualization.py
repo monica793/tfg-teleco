@@ -169,8 +169,8 @@ def plot_colision_correlador(senal_rx, corr_norm, instantes_reales,
     ax2.axhline(y=tau, color='red', linestyle=':', linewidth=1.6,
                 label=f'Umbral τ = {tau}')
 
-    # picos que superan el umbral con separación mínima
-    picos = _encontrar_picos(corr_norm, tau, separacion_min=len_preambulo // 2)
+    # picos que superan el umbral
+    picos = _encontrar_picos(corr_norm, tau)
 
     for i, idx in enumerate(picos):
         ax2.plot(idx, corr_norm[idx], '*', markersize=14,
@@ -209,34 +209,12 @@ def plot_colision_correlador(senal_rx, corr_norm, instantes_reales,
               f"{'✓ DETECTADO' if detectado else '✗ PERDIDO'}")
 
 
-def _encontrar_picos(corr_norm, tau, separacion_min=5):
+def _encontrar_picos(corr_norm, tau):
     """
-    Encuentra picos en corr_norm que superen tau con separación mínima
-    entre ellos. Evita contar el mismo pico varias veces.
-
-    Retorna lista de índices de picos ordenados por valor descendente.
+    Devuelve índices cuya correlación supera tau (umbral simple).
     """
     candidatos = np.where(corr_norm >= tau)[0]
-    if len(candidatos) == 0:
-        return []
-
-    picos = []
-    ultimo = -separacion_min - 1
-
-    # recorre los candidatos en orden y filtra los demasiado cercanos
-    for idx in candidatos:
-        if idx - ultimo >= separacion_min:
-            # toma el máximo local en una ventana alrededor de idx
-            ventana_inicio = max(0, idx - separacion_min)
-            ventana_fin    = min(len(corr_norm), idx + separacion_min)
-            idx_max = ventana_inicio + np.argmax(
-                corr_norm[ventana_inicio:ventana_fin]
-            )
-            if not picos or idx_max != picos[-1]:
-                picos.append(idx_max)
-                ultimo = idx_max
-
-    return picos
+    return list(candidatos.astype(int))
 
 
 def plot_roc_correlador(fpr, tpr, auc=None, ruta_salida=None):
@@ -497,4 +475,188 @@ def plot_pr_comparativa_correlador_vs_ml(
         os.makedirs(os.path.dirname(ruta_salida), exist_ok=True)
         plt.savefig(ruta_salida, dpi=150)
         print(f"Comparativa PR guardada en {ruta_salida}")
+    plt.show()
+
+
+def plot_respuesta_correlador_vs_ml(
+    corr_norm,
+    score_ml,
+    instantes_reales,
+    detecciones_corr,
+    detecciones_ml,
+    tau_corr=None,
+    tau_ml=None,
+    tolerancia_matriz=0,
+    ruta_salida=None,
+    titulo=None,
+):
+    """
+    Visualiza en dos paneles la respuesta temporal del correlador y de la CNN
+    sobre un mismo escenario, con marcas de verdad terreno y detecciones.
+    """
+    corr_norm = np.asarray(corr_norm, dtype=float).ravel()
+    score_ml = np.asarray(score_ml, dtype=float).ravel()
+    instantes_reales = np.asarray(instantes_reales, dtype=np.int64).ravel()
+    detecciones_corr = np.asarray(detecciones_corr, dtype=np.int64).ravel()
+    detecciones_ml = np.asarray(detecciones_ml, dtype=np.int64).ravel()
+
+    if corr_norm.size != score_ml.size:
+        n = min(corr_norm.size, score_ml.size)
+        corr_norm = corr_norm[:n]
+        score_ml = score_ml[:n]
+
+    n_muestras = len(corr_norm)
+    x = np.arange(n_muestras, dtype=np.int64)
+
+    fig = plt.figure(figsize=(16, 8))
+    gs = fig.add_gridspec(2, 2, width_ratios=[4.2, 1.8], wspace=0.22, hspace=0.18)
+    ax1 = fig.add_subplot(gs[0, 0])
+    ax2 = fig.add_subplot(gs[1, 0], sharex=ax1)
+    ax_cm_corr = fig.add_subplot(gs[0, 1])
+    ax_cm_ml = fig.add_subplot(gs[1, 1])
+    if titulo is None:
+        titulo = "Respuesta temporal de detectores sobre el mismo escenario"
+    fig.suptitle(titulo, fontsize=13, fontweight="bold")
+
+    # Panel 1: correlador
+    ax1.plot(x, corr_norm, color="royalblue", linewidth=1.2, label="corr_norm (correlador)")
+    if tau_corr is not None:
+        ax1.axhline(float(tau_corr), color="royalblue", linestyle=":", linewidth=1.0, alpha=0.9, label=f"Umbral correlador τ={tau_corr:g}")
+    for i, t in enumerate(instantes_reales):
+        ax1.axvline(int(t), color="gray", linestyle="--", linewidth=0.9, alpha=0.7, label="Inicio real (Pure ALOHA)" if i == 0 else None)
+    if detecciones_corr.size > 0:
+        y_corr = corr_norm[np.clip(detecciones_corr, 0, n_muestras - 1)]
+        ax1.plot(detecciones_corr, y_corr, marker="*", linestyle="None", markersize=11, color="darkorange", label="Detección correlador")
+    ax1.set_ylabel("Magnitud")
+    ax1.set_title("Correlador")
+    ax1.grid(True, alpha=0.25)
+    ax1.legend(fontsize=9, loc="upper right")
+
+    # Panel 2: red neuronal
+    ax2.plot(x, score_ml, color="darkgreen", linewidth=1.2, label="score por muestra (CNN)")
+    if tau_ml is not None:
+        ax2.axhline(float(tau_ml), color="darkgreen", linestyle=":", linewidth=1.0, alpha=0.9, label=f"Umbral CNN τ={tau_ml:g}")
+    for i, t in enumerate(instantes_reales):
+        ax2.axvline(int(t), color="gray", linestyle="--", linewidth=0.9, alpha=0.7, label="Inicio real (Pure ALOHA)" if i == 0 else None)
+    if detecciones_ml.size > 0:
+        y_ml = score_ml[np.clip(detecciones_ml, 0, n_muestras - 1)]
+        ax2.plot(detecciones_ml, y_ml, marker="o", linestyle="None", markersize=6, color="crimson", label="Detección CNN")
+    ax2.set_xlabel("Muestra")
+    ax2.set_ylabel("Score")
+    ax2.set_title("Detector neuronal")
+    ax2.grid(True, alpha=0.25)
+    ax2.legend(fontsize=9, loc="upper right")
+
+    # Matrices de confusión (por índice) para el mismo escenario
+    tol = int(max(0, tolerancia_matriz))
+    y_true = np.zeros(n_muestras, dtype=bool)
+    for t in instantes_reales:
+        i0 = max(0, int(t) - tol)
+        i1 = min(n_muestras - 1, int(t) + tol)
+        y_true[i0:i1 + 1] = True
+
+    if tau_corr is None:
+        tau_corr = 0.5
+    if tau_ml is None:
+        tau_ml = 0.5
+
+    y_pred_corr = corr_norm >= float(tau_corr)
+    y_pred_ml = score_ml >= float(tau_ml)
+
+    def _cm_counts(y_true_local, y_pred_local):
+        tp = int(np.sum(y_pred_local & y_true_local))
+        fp = int(np.sum(y_pred_local & ~y_true_local))
+        tn = int(np.sum(~y_pred_local & ~y_true_local))
+        fn = int(np.sum(~y_pred_local & y_true_local))
+        return np.array([[tn, fp], [fn, tp]], dtype=np.int64)
+
+    cm_corr = _cm_counts(y_true, y_pred_corr)
+    cm_ml = _cm_counts(y_true, y_pred_ml)
+
+    def _draw_cm(ax, cm, titulo_cm):
+        ax.imshow(cm, cmap="Blues")
+        ax.set_title(titulo_cm, fontsize=11)
+        ax.set_xticks([0, 1], labels=["Pred 0", "Pred 1"])
+        ax.set_yticks([0, 1], labels=["True 0", "True 1"])
+        for i in range(2):
+            for j in range(2):
+                ax.text(j, i, f"{cm[i, j]}", ha="center", va="center", color="black", fontsize=11, fontweight="bold")
+        ax.grid(False)
+
+    _draw_cm(ax_cm_corr, cm_corr, "Matriz confusión\nCorrelador")
+    _draw_cm(ax_cm_ml, cm_ml, "Matriz confusión\nCNN")
+
+    plt.tight_layout()
+    if ruta_salida is not None:
+        os.makedirs(os.path.dirname(ruta_salida), exist_ok=True)
+        plt.savefig(ruta_salida, dpi=150)
+        print(f"Comparativa temporal guardada en {ruta_salida}")
+    plt.show()
+
+
+def plot_zoom_respuesta_detectores(
+    corr_norm,
+    score_ml,
+    instantes_reales,
+    detecciones_corr,
+    detecciones_ml,
+    centro_muestra,
+    ancho_ventana=200,
+    tau_corr=None,
+    tau_ml=None,
+    ruta_salida=None,
+):
+    """
+    Zoom temporal alrededor de una muestra para inspección local.
+    """
+    corr_norm = np.asarray(corr_norm, dtype=float).ravel()
+    score_ml = np.asarray(score_ml, dtype=float).ravel()
+    n = min(len(corr_norm), len(score_ml))
+    corr_norm = corr_norm[:n]
+    score_ml = score_ml[:n]
+    instantes_reales = np.asarray(instantes_reales, dtype=np.int64).ravel()
+    detecciones_corr = np.asarray(detecciones_corr, dtype=np.int64).ravel()
+    detecciones_ml = np.asarray(detecciones_ml, dtype=np.int64).ravel()
+
+    c = int(centro_muestra)
+    hw = int(max(10, ancho_ventana // 2))
+    i0 = max(0, c - hw)
+    i1 = min(n - 1, c + hw)
+    x = np.arange(i0, i1 + 1, dtype=np.int64)
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 7), sharex=True)
+    fig.suptitle(f"Zoom local detectores (centro={c}, ventana=[{i0},{i1}])", fontsize=13, fontweight="bold")
+
+    # Correlador
+    ax1.plot(x, corr_norm[i0:i1 + 1], color="royalblue", linewidth=1.4, label="corr_norm")
+    if tau_corr is not None:
+        ax1.axhline(float(tau_corr), color="royalblue", linestyle=":", linewidth=1.0, label=f"τ corr={tau_corr:g}")
+    for t in instantes_reales[(instantes_reales >= i0) & (instantes_reales <= i1)]:
+        ax1.axvline(int(t), color="gray", linestyle="--", linewidth=1.0, alpha=0.8, label="Inicio real" if "Inicio real" not in [l.get_label() for l in ax1.lines] else None)
+    detc = detecciones_corr[(detecciones_corr >= i0) & (detecciones_corr <= i1)]
+    if detc.size > 0:
+        ax1.plot(detc, corr_norm[detc], "*", color="darkorange", markersize=11, label="Detección correlador")
+    ax1.set_ylabel("corr_norm")
+    ax1.grid(True, alpha=0.25)
+    ax1.legend(fontsize=9, loc="upper right")
+
+    # CNN
+    ax2.plot(x, score_ml[i0:i1 + 1], color="darkgreen", linewidth=1.4, label="score CNN")
+    if tau_ml is not None:
+        ax2.axhline(float(tau_ml), color="darkgreen", linestyle=":", linewidth=1.0, label=f"τ CNN={tau_ml:g}")
+    for t in instantes_reales[(instantes_reales >= i0) & (instantes_reales <= i1)]:
+        ax2.axvline(int(t), color="gray", linestyle="--", linewidth=1.0, alpha=0.8, label="Inicio real" if "Inicio real" not in [l.get_label() for l in ax2.lines] else None)
+    detm = detecciones_ml[(detecciones_ml >= i0) & (detecciones_ml <= i1)]
+    if detm.size > 0:
+        ax2.plot(detm, score_ml[detm], "o", color="crimson", markersize=5, label="Detección CNN")
+    ax2.set_xlabel("Muestra")
+    ax2.set_ylabel("score")
+    ax2.grid(True, alpha=0.25)
+    ax2.legend(fontsize=9, loc="upper right")
+
+    plt.tight_layout()
+    if ruta_salida is not None:
+        os.makedirs(os.path.dirname(ruta_salida), exist_ok=True)
+        plt.savefig(ruta_salida, dpi=150)
+        print(f"Zoom guardado en {ruta_salida}")
     plt.show()

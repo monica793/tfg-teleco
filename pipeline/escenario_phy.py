@@ -433,7 +433,6 @@ def ejecutar_receptor_neuronal(
                 pred_clase_ventana[inicio_batch:fin_batch] = logits.argmax(dim=1).cpu().numpy().astype(np.int64)
         class_por_muestra[diana_indices] = pred_clase_ventana
 
-    # Detecciones por umbral simple (sin NMS)
     instantes_detectados = buscar_picos_preambulo(
         corr_norm=score_por_muestra,
         tau=umbral,

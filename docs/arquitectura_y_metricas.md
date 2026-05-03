@@ -87,7 +87,7 @@ común antes de comparar detectores:
 Este protocolo aplica tanto al correlador como al detector ML futuro: cambia el
 motor de decisión, pero no cambia el escenario ni el árbitro de métricas.
 
-## 4.2 Pipeline del Correlador (Generación I/Q, lógica NMS, y el árbitro de métricas TP/FP/FN)
+## 4.2 Pipeline del Correlador (Generación I/Q, umbral y árbitro de métricas TP/FP/FN)
 
 ### Generación I/Q y canal
 
@@ -95,15 +95,9 @@ motor de decisión, pero no cambia el escenario ni el árbitro de métricas.
 - `generar_preambulo(..., tipo='zc')` activa por defecto el modo complejo.
 - `pipeline/channel.py` detecta automáticamente si la señal es compleja y, en ese caso, usa ruido AWGN complejo circularmente simétrico.
 
-### Detección multi-pico (NMS)
+### Detección por umbral
 
-Tras la correlación y umbral:
-
-1. Se toman candidatos con `corr_norm >= tau`.
-2. Se ordenan por amplitud descendente.
-3. Se selecciona un candidato solo si está al menos a `separacion_minima` de cualquier pico ya aceptado.
-
-Esto evita contar varias veces el mismo paquete cuando existe ensanchamiento del pico o ruido.
+Tras la correlación, se declaran detecciones en todas las muestras con `corr_norm >= tau` (sin fusionar picos vecinos).
 
 ### Árbitro de métricas: TP/FP/FN
 

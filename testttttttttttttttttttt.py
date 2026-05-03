@@ -15,7 +15,6 @@ esc = generar_escenario_phy(
 sal = ejecutar_receptor_correlador(
     esc,
     tau=0.65,
-    separacion_minima=len(esc["preambulo"]),
 )
 
 corr_norm = sal["corr_norm"]

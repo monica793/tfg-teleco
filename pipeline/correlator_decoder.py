@@ -40,37 +40,21 @@ def mapear_indice_correlador_a_muestra_rx(indice_correlador):
     return int(indice_correlador)
 
 
-def buscar_picos_preambulo(corr_norm, tau, separacion_minima):
+def buscar_picos_preambulo(corr_norm, tau):
     """
-    Selecciona picos de correlación por encima de tau con supresión no máxima (NMS).
-
-    Se ordenan los candidatos por valor de correlación descendente y se acepta un
-    pico si no hay otro ya aceptado a menos de separacion_minima muestras (típico:
-    longitud del preámbulo o del paquete).
+    Selecciona detecciones por umbral simple (todas las muestras con c >= tau).
 
     Parámetros
     ----------
-    corr_norm         : salida de correlador()
-    tau               : umbral mínimo de correlación normalizada
-    separacion_minima : distancia mínima entre picos (en índices del correlador = muestras RX)
+    corr_norm : salida de correlador() o score por muestra
+    tau       : umbral mínimo
 
     Retorna
     -------
-    indices_picos : np.ndarray (int64) — índices en el dominio del correlador (= inicio preámbulo en RX)
+    indices_picos : np.ndarray (int64)
     """
     c = np.asarray(corr_norm, dtype=float)
     candidatos = np.where(c >= tau)[0]
     if candidatos.size == 0:
         return np.array([], dtype=np.int64)
-
-    valores = c[candidatos]
-    orden = np.argsort(-valores)
-    candidatos = candidatos[orden]
-
-    elegidos = []
-    for idx in candidatos:
-        idx = int(idx)
-        if all(abs(idx - e) >= separacion_minima for e in elegidos):
-            elegidos.append(idx)
-
-    return np.array(sorted(elegidos), dtype=np.int64)
+    return candidatos.astype(np.int64)

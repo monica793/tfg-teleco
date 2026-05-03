@@ -221,11 +221,7 @@ def test_respuesta_temporal_correlador_vs_ml(
 
     if usar_preambulo_en_escenario:
         corr_norm = correlador(esc["senal_rx"], esc["preambulo"])
-        det_corr = buscar_picos_preambulo(
-            corr_norm=corr_norm,
-            tau=tau_corr,
-            separacion_minima=NUM_BITS_PRE,
-        )
+        det_corr = buscar_picos_preambulo(corr_norm=corr_norm, tau=tau_corr)
     else:
         # Sin preámbulo el correlador no es aplicable: se deja traza vacía para
         # mantener la misma función de visualización.
@@ -236,7 +232,6 @@ def test_respuesta_temporal_correlador_vs_ml(
         escenario=esc,
         modelo=modelo,
         umbral=tau_ml,
-        separacion_minima=NUM_BITS_PRE + NUM_BITS_DATOS,
         temperature=temperature_ml,
         dispositivo=dispositivo,
         stride=1,
@@ -310,7 +305,6 @@ def prueba_integracion_total(carga_G, ventana_frame_times=400, snr_db=6.0, tau=0
         snr_db=snr_db,
         tau=tau,
         tolerancia_muestras=tolerancia_muestras,
-        separacion_minima=num_bits_pre,
         num_iteraciones=num_iteraciones_mc,
         semilla_base=semilla_base,
         num_bits_pre=num_bits_pre,
@@ -613,7 +607,6 @@ def test_protocolo_comun_correlador(
         ventana_frame_times=ventana_frame_times,
         tau_evento=tau_evento,
         tolerancia_muestras=TOLERANCIA_MUESTRAS,
-        separacion_minima=NUM_BITS_PRE,
         num_iteraciones=num_iter,
         semilla_base=SEMILLA_BASE,
         num_bits_pre=NUM_BITS_PRE,
@@ -684,11 +677,10 @@ def test_protocolo_comun_neuronal(
     ruta_checkpoint   : ruta al archivo .ckpt generado por entrenar_modelo.py,
                         o None para ejecutar con pesos aleatorios (demo).
     ventana_frame_times: horizonte temporal de cada escenario.
-    umbral            : umbral de probabilidad [0,1] para NMS del detector ML.
+    umbral            : umbral de probabilidad [0,1] para declarar detección.
     usar_modo_rapido  : si True, usa NUM_ITERACIONES_MC_RAPIDO.
     """
     dispositivo = "cuda" if torch.cuda.is_available() else "cpu"
-    separacion_minima = NUM_BITS_PRE   # misma que el correlador
 
     if ruta_checkpoint is not None and os.path.exists(ruta_checkpoint):
         modelo = cargar_checkpoint_automatico(ruta_checkpoint, map_location=dispositivo)
@@ -720,7 +712,6 @@ def test_protocolo_comun_neuronal(
                     escenario=esc,
                     modelo=modelo,
                     umbral=umbral,
-                    separacion_minima=separacion_minima,
                     dispositivo=dispositivo,
                 )
                 metricas = evaluar_detecciones(
@@ -830,7 +821,6 @@ def test_ablacion_compacta(
                 escenario=esc,
                 modelo=modelo,
                 umbral=0.5,
-                separacion_minima=NUM_BITS_PRE + NUM_BITS_DATOS,
                 dispositivo=dispositivo,
                 stride=1,
                 long_ventana=128,
@@ -971,7 +961,6 @@ def test_diagnostico_profesor(
             escenario=esc,
             modelo=modelo,
             umbral=tau,
-            separacion_minima=NUM_BITS_PRE + NUM_BITS_DATOS,
             temperature=temperature,
             dispositivo=dispositivo,
             stride=1,

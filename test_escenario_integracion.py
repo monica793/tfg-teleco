@@ -27,11 +27,7 @@ class TestEscenarioIntegracion(unittest.TestCase):
         self.assertEqual(esc["senal_rx"].ndim, 1)
         self.assertEqual(esc["senal_rx"].shape[0], esc["longitud_total"])
 
-        salida = ejecutar_receptor_correlador(
-            esc,
-            tau=0.45,
-            separacion_minima=len(esc["preambulo"]),
-        )
+        salida = ejecutar_receptor_correlador(esc, tau=0.45)
         metricas = evaluar_detecciones(
             esc["instantes_llegada_muestras"],
             salida["instantes_detectados"],
