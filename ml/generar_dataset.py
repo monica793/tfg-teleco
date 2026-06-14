@@ -18,6 +18,7 @@ Modos de etiquetado
 """
 
 import argparse
+import json
 import os
 import numpy as np
 from numpy.lib.stride_tricks import sliding_window_view
@@ -184,6 +185,7 @@ def generar_dataset_desde_escenarios(
     modo_label: str = "onset_centro",
     n_escenarios_train: int = 200,
     n_escenarios_val: int = 50,
+    n_escenarios_test: int = 0,
     lista_G: tuple = LISTA_G_DEFAULT,
     lista_SNR_dB: tuple = LISTA_SNR_DEFAULT,
     ventana_frame_times: int = 50,
@@ -201,21 +203,31 @@ def generar_dataset_desde_escenarios(
         raise ValueError(f"modo_label debe ser uno de {MODOS_LABEL_VALIDOS}")
 
     rng = np.random.default_rng(semilla_base)
+    # Semilla separada para test: offset grande para garantizar no solapamiento
+    # con las semillas de train/val (que usan offset por g, snr, k pequeño)
+    SEMILLA_TEST_OFFSET = 100_000
+    rng_test = np.random.default_rng(semilla_base + SEMILLA_TEST_OFFSET)
+
     n_total = n_escenarios_train + n_escenarios_val
 
-    print("Dataset")
+    print("Dataset v2")
     print(f"  representacion={representacion}  modo_label={modo_label}")
-    print(f"  canales={IN_CHANNELS[representacion]}  train/val={n_escenarios_train}/{n_escenarios_val}")
+    print(f"  canales={IN_CHANNELS[representacion]}"
+          f"  train/val/test={n_escenarios_train}/{n_escenarios_val}/{n_escenarios_test}")
     if modo_label == "multiclase_onset":
-        print(f"  multiclase: C1<=|d|{k_c1}, C2<=|d|{k_c2}, resto C0")
+        print(f"  multiclase: C1<=|d|<={k_c1}, C2<=|d|<={k_c2}, resto C0")
     else:
-        print(f"  binario: ratio={ratio_undersampling} hard_neg_radius={hard_neg_radius} hard_neg_weight={hard_neg_weight}")
+        print(f"  binario: ratio={ratio_undersampling} "
+              f"hard_neg_radius={hard_neg_radius} hard_neg_weight={hard_neg_weight}")
 
-    X_tr, Y_tr, W_tr, X_vl, Y_vl, W_vl = [], [], [], [], [], []
-    D_tr, D_vl = [], []
+    X_tr, Y_tr, W_tr = [], [], []
+    X_vl, Y_vl, W_vl = [], [], []
+    X_te, Y_te, W_te = [], [], []
+    D_tr, D_vl, D_te = [], [], []
 
     for g in lista_G:
         for snr in lista_SNR_dB:
+            # --- train + val ---
             for k in range(n_total):
                 semilla_k = semilla_base + int(g * 1000) + int(snr * 100) + k
                 esc = generar_escenario_phy(
@@ -235,9 +247,7 @@ def generar_dataset_desde_escenarios(
                     ratio_undersampling=ratio_undersampling,
                     hard_neg_radius=hard_neg_radius,
                     hard_neg_weight=hard_neg_weight,
-                    k_c1=k_c1,
-                    k_c2=k_c2,
-                    rng=rng,
+                    k_c1=k_c1, k_c2=k_c2, rng=rng,
                 )
                 if len(Xk) == 0:
                     continue
@@ -250,43 +260,66 @@ def generar_dataset_desde_escenarios(
                     if modo_label == "multiclase_onset":
                         D_vl.append(Dk)
 
-    X_train = np.concatenate(X_tr, axis=0)
-    Y_train = np.concatenate(Y_tr, axis=0)
-    W_train = np.concatenate(W_tr, axis=0)
-    X_val = np.concatenate(X_vl, axis=0)
-    Y_val = np.concatenate(Y_vl, axis=0)
-    W_val = np.concatenate(W_vl, axis=0)
+            # --- test (semillas con offset grande, completamente independientes) ---
+            for k in range(n_escenarios_test):
+                semilla_k = semilla_base + SEMILLA_TEST_OFFSET + int(g * 1000) + int(snr * 100) + k
+                esc = generar_escenario_phy(
+                    carga_G=float(g),
+                    ventana_frame_times=ventana_frame_times,
+                    snr_db=float(snr),
+                    num_bits_pre=NUM_BITS_PRE,
+                    num_bits_datos=NUM_BITS_DATOS,
+                    semilla=semilla_k,
+                    usar_preambulo=usar_preambulo,
+                )
+                Xk, Yk, Wk, Dk = _extraer_ventanas_y_etiquetas(
+                    senal_rx=esc["senal_rx"],
+                    instantes_llegada=esc["instantes_llegada_muestras"],
+                    representacion=representacion,
+                    modo_label=modo_label,
+                    ratio_undersampling=ratio_undersampling,
+                    hard_neg_radius=hard_neg_radius,
+                    hard_neg_weight=hard_neg_weight,
+                    k_c1=k_c1, k_c2=k_c2, rng=rng_test,
+                )
+                if len(Xk) == 0:
+                    continue
+                X_te.append(Xk); Y_te.append(Yk); W_te.append(Wk)
+                if modo_label == "multiclase_onset":
+                    D_te.append(Dk)
 
-    idx_tr = rng.permutation(len(X_train))
-    idx_vl = rng.permutation(len(X_val))
-    X_train, Y_train, W_train = X_train[idx_tr], Y_train[idx_tr], W_train[idx_tr]
-    X_val, Y_val, W_val = X_val[idx_vl], Y_val[idx_vl], W_val[idx_vl]
+    def _concat_shuffle(Xl, Yl, Wl, Dl, rng_local):
+        X = np.concatenate(Xl, axis=0)
+        Y = np.concatenate(Yl, axis=0)
+        W = np.concatenate(Wl, axis=0)
+        idx = rng_local.permutation(len(X))
+        D = np.concatenate(Dl, axis=0)[idx] if Dl else None
+        return X[idx], Y[idx], W[idx], D
 
-    D_train = None
-    D_val = None
-    if modo_label == "multiclase_onset":
-        D_train = np.concatenate(D_tr, axis=0)[idx_tr]
-        D_val = np.concatenate(D_vl, axis=0)[idx_vl]
+    X_train, Y_train, W_train, D_train = _concat_shuffle(X_tr, Y_tr, W_tr, D_tr, rng)
+    X_val,   Y_val,   W_val,   D_val   = _concat_shuffle(X_vl, Y_vl, W_vl, D_vl, rng)
+    X_test  = Y_test = W_test = D_test = None
+    if X_te:
+        X_test, Y_test, W_test, D_test = _concat_shuffle(X_te, Y_te, W_te, D_te, rng_test)
 
-    if modo_label == "multiclase_onset":
-        cls_tr = [int(np.sum(Y_train == c)) for c in (0, 1, 2)]
-        cls_vl = [int(np.sum(Y_val == c)) for c in (0, 1, 2)]
-        print(f"  train class counts [C0,C1,C2]={cls_tr}")
-        print(f"  val   class counts [C0,C1,C2]={cls_vl}")
-        # Diagnóstico clave: distribución de |d| dentro de C2 para detectar sesgos
-        c2_tr = D_train[Y_train == 2]
-        c2_vl = D_val[Y_val == 2]
-        if len(c2_tr) > 0:
-            print(f"  C2 |d| train: min={np.min(c2_tr):.1f} p25={np.percentile(c2_tr,25):.1f} "
-                  f"p50={np.percentile(c2_tr,50):.1f} p75={np.percentile(c2_tr,75):.1f} max={np.max(c2_tr):.1f}")
-        if len(c2_vl) > 0:
-            print(f"  C2 |d| val  : min={np.min(c2_vl):.1f} p25={np.percentile(c2_vl,25):.1f} "
-                  f"p50={np.percentile(c2_vl,50):.1f} p75={np.percentile(c2_vl,75):.1f} max={np.max(c2_vl):.1f}")
-    else:
-        print(f"  train positivos={int(Y_train.sum())} ({100*Y_train.mean():.2f}%)")
-        print(f"  val   positivos={int(Y_val.sum())} ({100*Y_val.mean():.2f}%)")
+    # Resumen
+    def _resumen(nombre, Y, D):
+        if Y is None:
+            return
+        if modo_label == "multiclase_onset":
+            cls = [int(np.sum(Y == c)) for c in (0, 1, 2)]
+            print(f"  {nombre} class counts [C0,C1,C2]={cls}  total={len(Y)}")
+        else:
+            print(f"  {nombre} positivos={int(Y.sum())} ({100*Y.mean():.2f}%)  total={len(Y)}")
 
-    return X_train, Y_train, W_train, X_val, Y_val, W_val, D_train, D_val
+    _resumen("train", Y_train, D_train)
+    _resumen("val  ", Y_val,   D_val)
+    _resumen("test ", Y_test,  D_test)
+
+    return (X_train, Y_train, W_train,
+            X_val,   Y_val,   W_val,
+            X_test,  Y_test,  W_test,
+            D_train, D_val,   D_test)
 
 
 def guardar_dataset(
@@ -295,6 +328,7 @@ def guardar_dataset(
     modo_label: str = "onset_centro",
     n_escenarios_train: int = 200,
     n_escenarios_val: int = 50,
+    n_escenarios_test: int = 0,
     lista_G: tuple = LISTA_G_DEFAULT,
     lista_SNR_dB: tuple = LISTA_SNR_DEFAULT,
     ventana_frame_times: int = 50,
@@ -307,11 +341,15 @@ def guardar_dataset(
     k_c2: int = 12,
 ):
     os.makedirs(directorio_salida, exist_ok=True)
-    X_train, Y_train, W_train, X_val, Y_val, W_val, D_train, D_val = generar_dataset_desde_escenarios(
+    (X_train, Y_train, W_train,
+     X_val,   Y_val,   W_val,
+     X_test,  Y_test,  W_test,
+     D_train, D_val,   D_test) = generar_dataset_desde_escenarios(
         representacion=representacion,
         modo_label=modo_label,
         n_escenarios_train=n_escenarios_train,
         n_escenarios_val=n_escenarios_val,
+        n_escenarios_test=n_escenarios_test,
         lista_G=lista_G,
         lista_SNR_dB=lista_SNR_dB,
         ventana_frame_times=ventana_frame_times,
@@ -324,14 +362,55 @@ def guardar_dataset(
         k_c2=k_c2,
     )
 
+    # Guardar splits obligatorios
     for name, arr in (("X_train", X_train), ("Y_train", Y_train), ("W_train", W_train),
-                      ("X_val", X_val), ("Y_val", Y_val), ("W_val", W_val)):
+                      ("X_val",   X_val),   ("Y_val",   Y_val),   ("W_val",   W_val)):
         np.save(os.path.join(directorio_salida, f"{name}.npy"), arr)
+
+    # Guardar test si se generó
+    if X_test is not None:
+        for name, arr in (("X_test", X_test), ("Y_test", Y_test), ("W_test", W_test)):
+            np.save(os.path.join(directorio_salida, f"{name}.npy"), arr)
+
+    # Diagnóstico multiclase
     if modo_label == "multiclase_onset":
-        np.save(os.path.join(directorio_salida, "D_train.npy"), D_train)
-        np.save(os.path.join(directorio_salida, "D_val.npy"), D_val)
-        print("Guardado diagnóstico multiclase: D_train.npy / D_val.npy (|d| a onset más cercano)")
+        if D_train is not None:
+            np.save(os.path.join(directorio_salida, "D_train.npy"), D_train)
+        if D_val is not None:
+            np.save(os.path.join(directorio_salida, "D_val.npy"), D_val)
+        if D_test is not None:
+            np.save(os.path.join(directorio_salida, "D_test.npy"), D_test)
+
+    # metadata.json — reproduce exactamente las condiciones de generación
+    meta = {
+        "representacion":      representacion,
+        "modo_label":          modo_label,
+        "n_escenarios_train":  n_escenarios_train,
+        "n_escenarios_val":    n_escenarios_val,
+        "n_escenarios_test":   n_escenarios_test,
+        "lista_G":             list(lista_G),
+        "lista_SNR_dB":        list(lista_SNR_dB),
+        "ventana_frame_times": ventana_frame_times,
+        "long_ventana":        int(LONG_VENTANA),
+        "ratio_undersampling": ratio_undersampling,
+        "hard_neg_radius":     hard_neg_radius,
+        "hard_neg_weight":     hard_neg_weight,
+        "k_c1":                k_c1,
+        "k_c2":                k_c2,
+        "semilla_base":        semilla_base,
+        "semilla_test_offset": 100_000,
+        "num_bits_pre":        int(NUM_BITS_PRE),
+        "num_bits_datos":      int(NUM_BITS_DATOS),
+        "n_samples_train":     int(len(X_train)),
+        "n_samples_val":       int(len(X_val)),
+        "n_samples_test":      int(len(X_test)) if X_test is not None else 0,
+    }
+    with open(os.path.join(directorio_salida, "metadata.json"), "w") as f:
+        json.dump(meta, f, indent=2)
+
     print(f"Dataset guardado en: {directorio_salida}")
+    print(f"  Train: {len(X_train):,} ventanas  |  Val: {len(X_val):,}  |  "
+          f"Test: {len(X_test) if X_test is not None else 0:,}")
 
 
 if __name__ == "__main__":
@@ -339,8 +418,9 @@ if __name__ == "__main__":
     parser.add_argument("--representacion", type=str, default="iq", choices=list(REPRESENTACIONES_VALIDAS))
     parser.add_argument("--modo_label", type=str, default="onset_centro", choices=list(MODOS_LABEL_VALIDOS))
     parser.add_argument("--salida", type=str, default=None)
-    parser.add_argument("--n_train", type=int, default=200)
-    parser.add_argument("--n_val", type=int, default=50)
+    parser.add_argument("--n_train", type=int, default=700)
+    parser.add_argument("--n_val",   type=int, default=200)
+    parser.add_argument("--n_test",  type=int, default=200)
     parser.add_argument("--ventana_ft", type=int, default=50)
     parser.add_argument("--ratio_undersample", type=int, default=RATIO_UNDERSAMPLING)
     parser.add_argument("--semilla", type=int, default=SEMILLA_BASE)
@@ -358,6 +438,7 @@ if __name__ == "__main__":
         modo_label=args.modo_label,
         n_escenarios_train=args.n_train,
         n_escenarios_val=args.n_val,
+        n_escenarios_test=args.n_test,
         ventana_frame_times=args.ventana_ft,
         ratio_undersampling=args.ratio_undersample,
         semilla_base=args.semilla,

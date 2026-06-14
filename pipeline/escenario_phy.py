@@ -312,14 +312,15 @@ def ejecutar_receptor_neuronal(
     batch_size: int = 1024,
     long_ventana: int = 128,
     devolver_clases: bool = False,
+    ref_diana: str = "centro",
 ):
     """
     Receptor PHY basado en red neuronal CNN 1D.
 
     Desliza una ventana de `long_ventana` muestras sobre `senal_rx` con paso
     `stride` e infiere la probabilidad de que un paquete nuevo nazca en la
-    muestra central de cada ventana. El score resultante es equivalente a
-    `corr_norm` del correlador y permite usar el mismo árbitro de métricas.
+    posición de referencia de cada ventana. El score resultante es equivalente
+    a `corr_norm` del correlador y permite usar el mismo árbitro de métricas.
 
     Parámetros
     ----------
@@ -331,6 +332,10 @@ def ejecutar_receptor_neuronal(
     stride           : paso de la ventana deslizante (1 = resolución máxima)
     batch_size       : número de ventanas por batch de inferencia
     long_ventana     : longitud de cada ventana (debe coincidir con la del modelo)
+    ref_diana        : "centro" (onset_centro / multiclase_onset) o "inicio"
+                       (ventana_llena). Debe coincidir con el modo_label del
+                       entrenamiento para que el score quede alineado con los
+                       instantes reales de inicio de paquete.
 
     Retorna
     -------
@@ -345,9 +350,17 @@ def ejecutar_receptor_neuronal(
     if float(temperature) <= 0.0:
         raise ValueError("temperature debe ser > 0")
 
+    if ref_diana not in ("centro", "inicio"):
+        raise ValueError(f"ref_diana debe ser 'centro' o 'inicio', no {ref_diana!r}")
+
     senal_rx = np.asarray(escenario["senal_rx"])
     N = len(senal_rx)
-    mitad = long_ventana // 2   # posición de la diana dentro de cada ventana
+
+    # La "diana" es la muestra de la señal rx a la que se asigna el score de
+    # cada ventana. Debe coincidir con la referencia usada en el etiquetado:
+    #   onset_centro / multiclase_onset → centro de la ventana
+    #   ventana_llena                   → inicio de la ventana
+    offset_diana = (long_ventana // 2) if ref_diana == "centro" else 0
 
     # Generación de ventanas deslizantes
     indices_inicio = np.arange(0, N - long_ventana + 1, stride, dtype=np.int64)
@@ -418,7 +431,7 @@ def ejecutar_receptor_neuronal(
 
     # Asignar cada score a la muestra "diana" de su ventana
     score_por_muestra = np.zeros(N, dtype=np.float32)
-    diana_indices = indices_inicio + mitad
+    diana_indices = indices_inicio + offset_diana
     np.maximum.at(score_por_muestra, diana_indices, scores_ventanas)
 
     class_por_muestra = None
@@ -429,8 +442,8 @@ def ejecutar_receptor_neuronal(
         with torch.no_grad():
             for inicio_batch in range(0, n_ventanas, batch_size):
                 fin_batch = min(inicio_batch + batch_size, n_ventanas)
-                logits = modelo(ventanas_tensor[inicio_batch:fin_batch])
-                pred_clase_ventana[inicio_batch:fin_batch] = logits.argmax(dim=1).cpu().numpy().astype(np.int64)
+                logits_cls = modelo(ventanas_tensor[inicio_batch:fin_batch])
+                pred_clase_ventana[inicio_batch:fin_batch] = logits_cls.argmax(dim=1).cpu().numpy().astype(np.int64)
         class_por_muestra[diana_indices] = pred_clase_ventana
 
     instantes_detectados = buscar_picos_preambulo(
@@ -463,6 +476,7 @@ def ejecutar_monte_carlo_roc_neuronal(
     temperature=1.0,
     taus=None,
     usar_preambulo=False,
+    ref_diana: str = "centro",
 ):
     """
     ROC/PR por indice para el detector neuronal, promediadas en Monte Carlo.
@@ -502,6 +516,7 @@ def ejecutar_monte_carlo_roc_neuronal(
             dispositivo=dispositivo,
             stride=stride,
             long_ventana=long_ventana,
+            ref_diana=ref_diana,
         )
         roc = curva_roc_por_indice(
             corr_norm=sal_ml["score_por_muestra"],
