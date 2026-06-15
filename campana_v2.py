@@ -113,6 +113,17 @@ def _existe_ckpt(rep, label):
     return os.path.exists(_ruta_ckpt(rep, label))
 
 
+def _cargar_modelo_eval(rep, label):
+    """Carga checkpoint y lo mueve al dispositivo de inferencia."""
+    from ml.modelo_fase1 import cargar_checkpoint
+
+    dispositivo = "cuda" if torch.cuda.is_available() else "cpu"
+    modelo = cargar_checkpoint(_ruta_ckpt(rep, label), map_location="cpu")
+    modelo.to(dispositivo)
+    modelo.eval()
+    return modelo, dispositivo
+
+
 # ---------------------------------------------------------------------------
 # 1. GENERAR DATASETS
 # ---------------------------------------------------------------------------
@@ -197,19 +208,16 @@ def evaluar_clasificacion(rep, label):
     Devuelve dict con métricas.
     """
     from sklearn.metrics import roc_auc_score, f1_score, accuracy_score
-    from ml.modelo_fase1 import cargar_checkpoint
 
     ruta_test_X = os.path.join(_ruta_datos(rep, label), "X_test.npy")
     ruta_test_Y = os.path.join(_ruta_datos(rep, label), "Y_test.npy")
     if not os.path.exists(ruta_test_X):
-        return {"error": "sin test"}
+        return {}
 
     X = np.transpose(np.load(ruta_test_X), (0, 2, 1)).astype(np.float32)
     Y = np.load(ruta_test_Y)
 
-    dispositivo = "cuda" if torch.cuda.is_available() else "cpu"
-    modelo = cargar_checkpoint(_ruta_ckpt(rep, label), map_location=dispositivo)
-    modelo.eval()
+    modelo, dispositivo = _cargar_modelo_eval(rep, label)
 
     num_clases = getattr(modelo, "num_clases", 1)
     X_t = torch.from_numpy(X).to(dispositivo)
@@ -251,16 +259,13 @@ def evaluar_deteccion(rep, label, g=G_OBJ, snr=SNR_OBJ):
     Evalúa el modelo en escenarios PHY nuevos (Monte Carlo).
     Devuelve AUC-PR, AUC-ROC, F1 best, TP/FP/FN.
     """
-    from ml.modelo_fase1 import cargar_checkpoint
     from ml.evaluar import tabla_metricas
     from pipeline.escenario_phy import generar_escenario_phy, ejecutar_receptor_neuronal
     from pipeline.protocolo_evaluacion import (
         NUM_BITS_PRE, NUM_BITS_DATOS, TOLERANCIA_MUESTRAS, LONG_VENTANA_CNN,
     )
 
-    dispositivo = "cuda" if torch.cuda.is_available() else "cpu"
-    modelo = cargar_checkpoint(_ruta_ckpt(rep, label), map_location=dispositivo)
-    modelo.eval()
+    modelo, dispositivo = _cargar_modelo_eval(rep, label)
 
     ref_diana = REF_DIANA_MAP[label]
     taus = np.linspace(0.0, 1.0, 201)
@@ -325,8 +330,13 @@ def tabla_seleccion(reps=None, labels=None, usar_wandb=False):
                 print(f"[SKIP] Sin checkpoint: {rep}_{label}")
                 continue
             print(f"  Evaluando {rep}_{label} ...", end=" ", flush=True)
-            m_clf = evaluar_clasificacion(rep, label)
-            m_det = evaluar_deteccion(rep, label)
+            try:
+                m_clf = evaluar_clasificacion(rep, label)
+                m_det = evaluar_deteccion(rep, label)
+            except Exception as exc:
+                print(f"ERROR: {exc}")
+                continue
+
             print(f"PR-AUC_det={m_det['pr_auc_det']:.4f}  "
                   f"ROC-AUC_det={m_det['roc_auc_det']:.4f}  "
                   f"F1_det={m_det['f1_det']:.4f}")
@@ -373,7 +383,6 @@ def evaluar_comparativa_final(campeon_rep=None, campeon_label=None):
     Si no se pasa el campeón, lo lee de results_v2/tables/campeon.json.
     """
     import csv
-    from ml.modelo_fase1 import cargar_checkpoint
     from ml.evaluar import tabla_metricas
     from pipeline.escenario_phy import (
         generar_escenario_phy, ejecutar_receptor_neuronal,
@@ -399,10 +408,7 @@ def evaluar_comparativa_final(campeon_rep=None, campeon_label=None):
 
     print(f"\nComparativa final: correlador vs {campeon_rep}_{campeon_label}")
 
-    dispositivo = "cuda" if torch.cuda.is_available() else "cpu"
-    modelo = cargar_checkpoint(_ruta_ckpt(campeon_rep, campeon_label),
-                               map_location=dispositivo)
-    modelo.eval()
+    modelo, dispositivo = _cargar_modelo_eval(campeon_rep, campeon_label)
     ref_diana = REF_DIANA_MAP[campeon_label]
     taus = np.linspace(0.0, 1.0, 201)
 
