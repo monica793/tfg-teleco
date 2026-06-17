@@ -94,3 +94,35 @@ def buscar_picos_nms(score, tau, ventana_nms):
             kept.append(d)
 
     return np.array(sorted(kept), dtype=np.int64)
+
+
+def buscar_picos_centro_activacion(score, tau):
+    """
+    Detección por centro de zona de activación.
+
+    Para cada grupo de muestras contiguas con score >= tau, devuelve la muestra
+    central de ese grupo como instante detectado. Esto es apropiado cuando el
+    detector neuronal genera activaciones uniformes en una zona de anchura fija
+    (e.g., 2·k_c1 + 1 muestras), ya que el centro geométrico de esa zona es el
+    mejor estimador del instante real de inicio del paquete.
+
+    Parámetros
+    ----------
+    score : array de scores por muestra (float)
+    tau   : umbral mínimo de activación
+
+    Retorna
+    -------
+    centros : np.ndarray (int64) — un instante detectado por zona de activación
+    """
+    c = np.asarray(score, dtype=float)
+    activado = (c >= tau).astype(np.int8)
+    if not np.any(activado):
+        return np.array([], dtype=np.int64)
+
+    cambios = np.diff(activado, prepend=0, append=0)
+    inicios = np.where(cambios == 1)[0]
+    fines   = np.where(cambios == -1)[0] - 1  # último índice incluido
+
+    centros = ((inicios + fines) // 2).astype(np.int64)
+    return centros
