@@ -58,3 +58,39 @@ def buscar_picos_preambulo(corr_norm, tau):
     if candidatos.size == 0:
         return np.array([], dtype=np.int64)
     return candidatos.astype(np.int64)
+
+
+def buscar_picos_nms(score, tau, ventana_nms):
+    """
+    Detección con umbral + supresión de no-máximos (NMS).
+
+    Entre todas las muestras que superan `tau`, elimina las que estén a menos de
+    `ventana_nms` muestras de otra con score mayor. Así, respuestas anchas (CNN)
+    o rachas de correlación (correlador) producen como máximo una detección por
+    zona de activación, igual que el número real de paquetes.
+
+    Parámetros
+    ----------
+    score       : array de scores por muestra (float)
+    tau         : umbral mínimo de activación
+    ventana_nms : distancia mínima en muestras entre dos detecciones consecutivas
+
+    Retorna
+    -------
+    picos : np.ndarray (int64) — instantes detectados tras NMS
+    """
+    c = np.asarray(score, dtype=float)
+    candidatos = np.where(c >= tau)[0]
+    if candidatos.size == 0:
+        return np.array([], dtype=np.int64)
+
+    scores_c = c[candidatos]
+    orden = np.argsort(-scores_c)  # descendente por score
+
+    kept = []
+    for i in orden:
+        d = int(candidatos[i])
+        if all(abs(d - k) > ventana_nms for k in kept):
+            kept.append(d)
+
+    return np.array(sorted(kept), dtype=np.int64)
